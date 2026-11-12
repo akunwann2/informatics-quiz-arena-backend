@@ -1,0 +1,1397 @@
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Informatics Quiz Arena</title>
+
+    <script src="http://localhost:3000/socket.io/socket.io.js"></script>
+
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: Arial, sans-serif;
+        }
+
+        body {
+            background: #101426;
+            color: white;
+            padding: 25px;
+            max-width: 900px;
+            margin: auto;
+        }
+
+        .panel {
+            background: #1c2540;
+            padding: 22px;
+            border-radius: 14px;
+            margin-bottom: 20px;
+        }
+
+        h1, h2 {
+            color: #65e6ff;
+        }
+
+        input, button {
+            width: 100%;
+            padding: 13px;
+            margin: 7px 0;
+            border-radius: 8px;
+            border: none;
+            font-size: 15px;
+        }
+
+        input {
+            background: #303c5d;
+            color: white;
+        }
+
+        input::placeholder {
+            color: #aab5d1;
+        }
+
+        button {
+            background: #6755e8;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        button:hover:not(:disabled) {
+            background: #8172ff;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .status {
+            color: #65e6ff;
+            font-weight: bold;
+        }
+
+        .player {
+            background: #303c5d;
+            padding: 14px;
+            border-radius: 8px;
+            margin: 8px 0;
+        }
+
+        .option {
+            background: #303c5d;
+            border: 1px solid #596887;
+            text-align: left;
+            transition: 0.2s;
+        }
+
+        .option:not(:disabled):hover {
+            background: #46577e;
+            border-color: #65e6ff;
+        }
+
+        .option.selected {
+            background: #5143b5;
+            border: 2px solid #65e6ff;
+        }
+
+        .question {
+            font-size: 21px;
+            line-height: 1.5;
+            margin: 20px 0;
+        }
+
+        .timer {
+            color: #fbbf24;
+            font-size: 35px;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .success {
+            color: #4ade80;
+            font-weight: bold;
+        }
+
+        .error {
+            color: #fb7185;
+            font-weight: bold;
+        }
+
+        .leaderboard-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #303c5d;
+            padding: 13px;
+            margin: 8px 0;
+            border-radius: 8px;
+        }
+
+        .rank {
+            color: #65e6ff;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+
+        .score {
+            color: #fbbf24;
+            font-weight: bold;
+        }
+
+        #log {
+            background: #101426;
+            padding: 12px;
+            border-radius: 8px;
+            min-height: 80px;
+            font-size: 13px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .muted {
+            color: #aab5d1;
+            font-size: 13px;
+        }
+
+        .room-code {
+            color: #fbbf24;
+            font-size: 22px;
+            letter-spacing: 3px;
+        }
+
+        .divider {
+            border: 0;
+            border-top: 1px solid #46577e;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>INFORMATICS QUIZ ARENA</h1>
+    <p>Multiplayer Quiz Test</p>
+
+    <!-- IDENTITAS DAN ROOM -->
+    <div class="panel" id="roomForm">
+
+        <h2>Identitas Pemain</h2>
+
+        <input
+            id="nickname"
+            maxlength="20"
+            placeholder="Masukkan nickname"
+            autocomplete="off"
+        >
+
+        <button id="createButton" onclick="createRoom()">
+            BUAT ROOM BARU
+        </button>
+
+        <hr class="divider">
+
+        <h2>Gabung Room</h2>
+
+        <input
+            id="roomCode"
+            maxlength="6"
+            placeholder="Masukkan kode room"
+            autocomplete="off"
+        >
+
+        <button id="joinButton" onclick="joinRoom()">
+            GABUNG ROOM
+        </button>
+
+    </div>
+
+    <!-- INFORMASI ROOM -->
+    <div class="panel">
+
+        <h2>Informasi Room</h2>
+
+        <p>
+            Status:
+            <span id="status" class="status">
+                Belum terhubung
+            </span>
+        </p>
+
+        <p>
+            Kode Room:
+            <strong id="displayCode" class="room-code">-</strong>
+        </p>
+
+        <p>
+            Jumlah Pemain:
+            <strong id="totalPlayers">0</strong>
+            / 50
+        </p>
+
+        <h3>Daftar Pemain</h3>
+
+        <div id="players">
+            Belum ada pemain.
+        </div>
+
+        <button id="syncButton" onclick="syncRoom()">
+            PERBARUI LOBBY
+        </button>
+
+        <button
+            id="startButton"
+            class="hidden"
+            onclick="startGame()"
+            style="background:#16a36a"
+        >
+            MULAI KUIS
+        </button>
+
+        <button
+            id="leaveButton"
+            onclick="leaveRoom()"
+            style="background:#d94c65"
+        >
+            KELUAR ROOM
+        </button>
+
+    </div>
+
+    <!-- TAMPILAN KUIS -->
+    <div id="quizPanel" class="panel hidden">
+
+        <h2>ARENA KUIS</h2>
+
+        <p id="questionProgress">
+            Soal 0 dari 0
+        </p>
+
+        <div id="timer" class="timer">
+            20
+        </div>
+
+        <div id="questionText" class="question">
+            Menunggu soal...
+        </div>
+
+        <div id="options"></div>
+
+        <p id="quizMessage" class="status"></p>
+
+        <p class="muted" id="answerInfo">
+            Pilih salah satu jawaban.
+        </p>
+
+    </div>
+
+    <!-- LEADERBOARD -->
+    <div id="leaderboardPanel" class="panel hidden">
+
+        <h2>LEADERBOARD</h2>
+
+        <p class="muted">
+            Peringkat pemain berdasarkan total skor.
+        </p>
+
+        <div id="leaderboard">
+            Belum ada skor.
+        </div>
+
+    </div>
+
+    <!-- AKTIVITAS -->
+    <div class="panel">
+
+        <h2>Aktivitas Multiplayer</h2>
+
+        <div id="log">
+            Menunggu aktivitas...
+        </div>
+
+    </div>
+
+<script>
+
+    // ======================================
+    // KONFIGURASI
+    // ======================================
+
+    const API_URL = "http://localhost:3000";
+
+    let socket = null;
+
+    let currentRoom = null;
+    let currentPlayer = null;
+
+    let isHost = false;
+
+    let timerInterval = null;
+
+    let currentQuestion = null;
+    let hasAnswered = false;
+
+    let isConnecting = false;
+    let isLeaving = false;
+
+    // ======================================
+    // HELPER
+    // ======================================
+
+    function getElement(id) {
+        return document.getElementById(id);
+    }
+
+    function setStatus(message) {
+        getElement("status").textContent = message;
+    }
+
+    function showElement(id) {
+        getElement(id).classList.remove("hidden");
+    }
+
+    function hideElement(id) {
+        getElement(id).classList.add("hidden");
+    }
+
+    function isTrue(value) {
+        return value === true ||
+            Number(value) === 1;
+    }
+
+    // ======================================
+    // LOG AKTIVITAS
+    // ======================================
+
+    function log(message) {
+
+        const area = getElement("log");
+
+        area.textContent =
+            new Date().toLocaleTimeString() +
+            " - " +
+            message +
+            "\n" +
+            area.textContent;
+
+    }
+
+    // ======================================
+    // API RESPONSE
+    // ======================================
+
+    async function readApiResponse(response) {
+
+        const text = await response.text();
+
+        let result;
+
+        try {
+            result = JSON.parse(text);
+        } catch (error) {
+            throw new Error(
+                "Respons server bukan JSON. Periksa endpoint API dan backend."
+            );
+        }
+
+        if (!response.ok || result.success === false) {
+            throw new Error(
+                result.message || "Permintaan gagal."
+            );
+        }
+
+        return result;
+    }
+
+    // ======================================
+    // RENDER ROOM
+    // ======================================
+
+    function renderRoom(data) {
+
+        if (!data) return;
+
+        const players = data.players || [];
+
+        getElement("totalPlayers").textContent =
+            players.length;
+
+        const container = getElement("players");
+
+        container.innerHTML = "";
+
+        if (players.length === 0) {
+            container.textContent = "Belum ada pemain.";
+            return;
+        }
+
+        players.forEach(player => {
+
+            const item = document.createElement("div");
+
+            item.className = "player";
+
+            const hostLabel = isTrue(player.is_host)
+                ? " (HOST)"
+                : "";
+
+            const connectionLabel = isTrue(player.is_connected)
+                ? " 🟢 Online"
+                : " ⚪ Offline";
+
+            item.textContent =
+                player.nickname +
+                hostLabel +
+                connectionLabel;
+
+            container.appendChild(item);
+
+        });
+
+    }
+
+    // ======================================
+    // CONNECT TO ROOM
+    // ======================================
+
+    async function connectToRoom(responseData) {
+
+        if (isConnecting) return;
+
+        isConnecting = true;
+
+        try {
+
+            // Mendukung format respons:
+            // { data: { room_code, player } }
+            // atau { room_code, player }
+
+            const data = responseData.data || responseData;
+
+            if (
+                !data.room_code ||
+                !data.player ||
+                !data.player.player_id
+            ) {
+                throw new Error(
+                    "Format respons room tidak sesuai."
+                );
+            }
+
+            currentRoom = data.room_code;
+
+            currentPlayer = data.player.player_id;
+
+            isHost = isTrue(data.player.is_host);
+
+            getElement("displayCode").textContent =
+                currentRoom;
+
+            setStatus("Menghubungkan ke room...");
+
+            getElement("startButton").classList.toggle(
+                "hidden",
+                !isHost
+            );
+
+            getElement("startButton").disabled = false;
+
+            getElement("roomForm").classList.add("hidden");
+
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+
+            clearInterval(timerInterval);
+
+            socket = io(API_URL, {
+                reconnection: true,
+                reconnectionAttempts: 5,
+                reconnectionDelay: 1000
+            });
+
+            // ==================================
+            // SOCKET CONNECT
+            // ==================================
+
+            socket.on("connect", () => {
+
+                log("Socket terhubung: " + socket.id);
+
+                socket.emit("room:join", {
+                    room_code: currentRoom,
+                    player_id: currentPlayer
+                });
+
+            });
+
+            // ==================================
+            // SOCKET CONNECT ERROR
+            // ==================================
+
+            socket.on("connect_error", error => {
+
+                log("Koneksi Socket gagal: " + error.message);
+
+                setStatus("Gagal menghubungkan");
+
+            });
+
+            // ==================================
+            // ROOM JOINED
+            // ==================================
+
+            socket.on("room:joined", response => {
+
+                if (!response || !response.success) {
+
+                    log("Gagal masuk room.");
+
+                    setStatus("Gagal masuk room");
+
+                    return;
+                }
+
+                setStatus("Terhubung ke room");
+
+                renderRoom({
+                    players: response.players || []
+                });
+
+                log("Berhasil terhubung ke room.");
+
+            });
+
+            // ==================================
+            // ROOM UPDATED
+            // ==================================
+
+            socket.on("room:updated", data => {
+
+                renderRoom(data);
+
+                log("Daftar pemain diperbarui.");
+
+            });
+
+            // ==================================
+            // PLAYER LEFT
+            // ==================================
+
+            socket.on("room:player_left", response => {
+
+                if (response && response.player_id) {
+
+                    log(
+                        "Pemain keluar: " +
+                        response.player_id
+                    );
+
+                }
+
+            });
+
+            // ==================================
+            // ROOM ERROR
+            // ==================================
+
+            socket.on("room:error", error => {
+
+                const message = error?.message ||
+                    "Terjadi kesalahan pada room.";
+
+                log("ERROR: " + message);
+
+                setStatus("Terjadi kesalahan");
+
+                getElement("startButton").disabled = false;
+
+                alert(message);
+
+            });
+
+            // ==================================
+            // GAME ERROR
+            // ==================================
+
+            socket.on("game:error", error => {
+
+                const message = error?.message ||
+                    "Permintaan permainan gagal.";
+
+                log("GAME ERROR: " + message);
+
+                getElement("startButton").disabled = false;
+
+                alert(message);
+
+            });
+
+            // ==================================
+            // GAME STARTED
+            // ==================================
+
+            socket.on("game:started", response => {
+
+                log(
+                    response?.message ||
+                    "Permainan dimulai."
+                );
+
+                setStatus("Kuis sedang berlangsung");
+
+                hideElement("startButton");
+
+                showElement("quizPanel");
+
+                showElement("leaderboardPanel");
+
+                hideElement("roomForm");
+
+            });
+
+            // ==================================
+            // QUESTION STARTED
+            // ==================================
+
+            socket.on("game:question_started", data => {
+
+                showQuestion(data);
+
+            });
+
+            // ==================================
+            // ANSWER RESULT
+            // ==================================
+
+            socket.on("game:answer_result", response => {
+
+                if (!response.success) {
+
+                    getElement("quizMessage").textContent =
+                        response.message || "Jawaban gagal diproses.";
+
+                    getElement("quizMessage").className =
+                        "error";
+
+                    log(
+                        "Jawaban gagal: " +
+                        (response.message || "Kesalahan server")
+                    );
+
+                    return;
+                }
+
+                const message = response.is_correct
+                    ? "BENAR! +" + response.points + " poin"
+                    : "SALAH! +" + response.points + " poin";
+
+                getElement("quizMessage").textContent =
+                    message;
+
+                getElement("quizMessage").className =
+                    response.is_correct
+                        ? "success"
+                        : "error";
+
+                getElement("answerInfo").textContent =
+                    response.explanation ||
+                    "Jawaban telah diperiksa.";
+
+                log(message);
+
+            });
+
+            // ==================================
+            // LEADERBOARD UPDATE
+            // ==================================
+
+            socket.on("game:leaderboard", data => {
+
+                renderLeaderboard(data?.players || []);
+
+                log("Leaderboard diperbarui.");
+
+            });
+
+            // ==================================
+            // GAME FINISHED
+            // ==================================
+
+            socket.on("game:finished", data => {
+
+                clearInterval(timerInterval);
+
+                hasAnswered = true;
+
+                setStatus("Kuis selesai");
+
+                getElement("timer").textContent = "0";
+
+                getElement("questionText").textContent =
+                    "KUIS SELESAI!";
+
+                getElement("options").innerHTML = "";
+
+                getElement("quizMessage").textContent =
+                    data?.message || "Permainan selesai.";
+
+                getElement("answerInfo").textContent =
+                    "Terima kasih telah bermain!";
+
+                renderLeaderboard(data?.leaderboard || []);
+
+                showElement("leaderboardPanel");
+
+                log("Kuis selesai!");
+
+            });
+
+            // ==================================
+            // DISCONNECT
+            // ==================================
+
+            socket.on("disconnect", reason => {
+
+                if (isLeaving) return;
+
+                setStatus("Terputus");
+
+                log("Socket terputus: " + reason);
+
+            });
+
+        } catch (error) {
+
+            log("Gagal menghubungkan room: " + error.message);
+
+            alert(error.message);
+
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+
+            currentRoom = null;
+            currentPlayer = null;
+            isHost = false;
+
+            getElement("displayCode").textContent = "-";
+
+            showElement("roomForm");
+
+            hideElement("startButton");
+
+            setStatus("Belum terhubung");
+
+        } finally {
+
+            isConnecting = false;
+
+        }
+
+    }
+
+    // ======================================
+    // SHOW QUESTION
+    // ======================================
+
+    function showQuestion(data) {
+
+        clearInterval(timerInterval);
+
+        currentQuestion = data;
+
+        hasAnswered = false;
+
+        showElement("quizPanel");
+
+        showElement("leaderboardPanel");
+
+        getElement("questionProgress").textContent =
+            "Soal " +
+            data.question_number +
+            " dari " +
+            data.total_questions;
+
+        getElement("questionText").textContent =
+            data.question_text || "Soal tidak tersedia.";
+
+        getElement("quizMessage").textContent =
+            "Perhatikan soal dengan baik!";
+
+        getElement("quizMessage").className =
+            "status";
+
+        getElement("answerInfo").textContent =
+            "Pilih salah satu jawaban.";
+
+        // Tampilkan pilihan jawaban.
+
+        const optionsContainer =
+            getElement("options");
+
+        optionsContainer.innerHTML = "";
+
+        const options = data.options || [];
+
+        options.forEach((option, index) => {
+
+            const button = document.createElement("button");
+
+            button.className = "option";
+
+            button.textContent =
+                String.fromCharCode(65 + index) +
+                ". " +
+                option.option_text;
+
+            button.dataset.optionId = option.option_id;
+
+            button.onclick = () => {
+
+                submitAnswer(option.option_id, button);
+
+            };
+
+            optionsContainer.appendChild(button);
+
+        });
+
+        // Timer berdasarkan waktu akhir server.
+
+        if (!data.ends_at) {
+
+            getElement("timer").textContent =
+                "Menunggu...";
+
+            log("Batas waktu soal belum tersedia.");
+
+            return;
+
+        }
+
+        updateTimer();
+
+        timerInterval = setInterval(updateTimer, 200);
+
+        function updateTimer() {
+
+            const remaining = Math.max(
+                0,
+                Math.ceil(
+                    (Number(data.ends_at) - Date.now()) / 1000
+                )
+            );
+
+            getElement("timer").textContent =
+                remaining;
+
+            if (remaining <= 0) {
+
+                clearInterval(timerInterval);
+
+                disableOptions();
+
+                if (!hasAnswered) {
+
+                    getElement("quizMessage").textContent =
+                        "Waktu menjawab habis!";
+
+                    getElement("quizMessage").className =
+                        "error";
+
+                }
+
+            }
+
+        }
+
+        log(
+            "Soal " +
+            data.question_number +
+            " diterima dari server."
+        );
+
+    }
+
+    // ======================================
+    // SUBMIT ANSWER
+    // ======================================
+
+    function submitAnswer(optionId, selectedButton) {
+
+        if (!socket || !socket.connected) {
+
+            alert("Koneksi ke server terputus.");
+
+            return;
+
+        }
+
+        if (hasAnswered) return;
+
+        if (!currentQuestion) return;
+
+        if (
+            currentQuestion.ends_at &&
+            Date.now() >= Number(currentQuestion.ends_at)
+        ) {
+
+            alert("Waktu menjawab sudah habis.");
+
+            disableOptions();
+
+            return;
+
+        }
+
+        hasAnswered = true;
+
+        selectedButton.classList.add("selected");
+
+        disableOptions();
+
+        getElement("quizMessage").textContent =
+            "Jawaban sedang diperiksa...";
+
+        getElement("quizMessage").className =
+            "status";
+
+        getElement("answerInfo").textContent =
+            "Menunggu hasil dari server...";
+
+        // Backend menerima option_id.
+
+        socket.emit("game:submit_answer", {
+            option_id: optionId
+        });
+
+        log("Jawaban dikirim ke server.");
+
+    }
+
+    // ======================================
+    // DISABLE OPTIONS
+    // ======================================
+
+    function disableOptions() {
+
+        const buttons =
+            document.querySelectorAll("#options button");
+
+        buttons.forEach(button => {
+
+            button.disabled = true;
+
+        });
+
+    }
+
+    // ======================================
+    // RENDER LEADERBOARD
+    // ======================================
+
+    function renderLeaderboard(players) {
+
+        const container =
+            getElement("leaderboard");
+
+        container.innerHTML = "";
+
+        if (!players || players.length === 0) {
+
+            container.textContent = "Belum ada skor.";
+
+            return;
+
+        }
+
+        players.forEach((player, index) => {
+
+            const item = document.createElement("div");
+
+            item.className = "leaderboard-item";
+
+            const name = document.createElement("span");
+
+            const rank = document.createElement("span");
+
+            rank.className = "rank";
+
+            rank.textContent = "#" + (index + 1);
+
+            name.appendChild(rank);
+
+            name.appendChild(
+                document.createTextNode(
+                    player.nickname || "Pemain"
+                )
+            );
+
+            const score = document.createElement("span");
+
+            score.className = "score";
+
+            score.textContent =
+                Number(player.score || 0).toLocaleString("id-ID") +
+                " poin";
+
+            item.appendChild(name);
+
+            item.appendChild(score);
+
+            container.appendChild(item);
+
+        });
+
+    }
+
+    // ======================================
+    // VALIDASI NICKNAME
+    // ======================================
+
+    function getNickname() {
+
+        const nickname =
+            getElement("nickname").value.trim();
+
+        if (!nickname) {
+
+            alert("Masukkan nickname terlebih dahulu.");
+
+            getElement("nickname").focus();
+
+            return null;
+
+        }
+
+        if (nickname.length > 20) {
+
+            alert("Nickname maksimal 20 karakter.");
+
+            return null;
+
+        }
+
+        return nickname;
+
+    }
+
+    // ======================================
+    // CREATE ROOM
+    // ======================================
+
+    async function createRoom() {
+
+        if (isConnecting) return;
+
+        const nickname = getNickname();
+
+        if (!nickname) return;
+
+        const button = getElement("createButton");
+
+        button.disabled = true;
+
+        button.textContent = "MEMBUAT ROOM...";
+
+        try {
+
+            const response = await fetch(
+                API_URL + "/api/rooms",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        nickname: nickname,
+                        question_count: 25,
+                        time_per_question: 20
+                    })
+                }
+            );
+
+            const result = await readApiResponse(response);
+
+            if (!result.data) {
+
+                throw new Error(
+                    "Data room tidak ditemukan pada respons server."
+                );
+
+            }
+
+            log(
+                "Room berhasil dibuat: " +
+                result.data.room_code
+            );
+
+            await connectToRoom(result.data);
+
+        } catch (error) {
+
+            log("Gagal membuat room: " + error.message);
+
+            alert(error.message);
+
+        } finally {
+
+            button.disabled = false;
+
+            button.textContent = "BUAT ROOM BARU";
+
+        }
+
+    }
+
+    // ======================================
+    // JOIN ROOM
+    // ======================================
+
+    async function joinRoom() {
+
+        if (isConnecting) return;
+
+        const nickname = getNickname();
+
+        if (!nickname) return;
+
+        const roomCode =
+            getElement("roomCode").value.trim().toUpperCase();
+
+        if (!roomCode) {
+
+            alert("Masukkan kode room.");
+
+            getElement("roomCode").focus();
+
+            return;
+
+        }
+
+        const button = getElement("joinButton");
+
+        button.disabled = true;
+
+        button.textContent = "MENGGABUNGKAN...";
+
+        try {
+
+            const response = await fetch(
+                API_URL + "/api/rooms/join",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        nickname: nickname,
+                        room_code: roomCode
+                    })
+                }
+            );
+
+            const result = await readApiResponse(response);
+
+            if (!result.data) {
+
+                throw new Error(
+                    "Data room tidak ditemukan pada respons server."
+                );
+
+            }
+
+            log(
+                "Berhasil bergabung ke room: " +
+                result.data.room_code
+            );
+
+            await connectToRoom(result.data);
+
+        } catch (error) {
+
+            log("Gagal bergabung: " + error.message);
+
+            alert(error.message);
+
+        } finally {
+
+            button.disabled = false;
+
+            button.textContent = "GABUNG ROOM";
+
+        }
+
+    }
+
+    // ======================================
+    // HOST START GAME
+    // ======================================
+
+    function startGame() {
+
+        if (!socket || !socket.connected) {
+
+            alert("Belum terhubung ke room.");
+
+            return;
+
+        }
+
+        if (!isHost) {
+
+            alert("Hanya host yang bisa memulai kuis.");
+
+            return;
+
+        }
+
+        const button = getElement("startButton");
+
+        button.disabled = true;
+
+        socket.emit("game:start");
+
+        log("Host meminta memulai kuis.");
+
+    }
+
+    // ======================================
+    // SYNC ROOM
+    // ======================================
+
+    function syncRoom() {
+
+        if (!socket || !socket.connected) {
+
+            alert("Belum terhubung ke room.");
+
+            return;
+
+        }
+
+        socket.emit("room:sync");
+
+        log("Meminta pembaruan informasi room.");
+
+    }
+
+    // ======================================
+    // LEAVE ROOM
+    // ======================================
+
+    function leaveRoom() {
+
+        isLeaving = true;
+
+        if (socket && socket.connected) {
+
+            socket.emit("room:leave");
+
+            socket.disconnect();
+
+        }
+
+        socket = null;
+
+        clearInterval(timerInterval);
+
+        currentRoom = null;
+        currentPlayer = null;
+
+        currentQuestion = null;
+
+        isHost = false;
+        hasAnswered = false;
+
+        getElement("status").textContent =
+            "Keluar dari room";
+
+        getElement("displayCode").textContent = "-";
+
+        getElement("totalPlayers").textContent = "0";
+
+        getElement("players").textContent =
+            "Belum ada pemain.";
+
+        hideElement("quizPanel");
+
+        hideElement("leaderboardPanel");
+
+        showElement("roomForm");
+
+        hideElement("startButton");
+
+        getElement("startButton").disabled = false;
+
+        getElement("timer").textContent = "20";
+
+        getElement("questionProgress").textContent =
+            "Soal 0 dari 0";
+
+        getElement("questionText").textContent =
+            "Menunggu soal...";
+
+        getElement("quizMessage").textContent = "";
+
+        getElement("answerInfo").textContent =
+            "Pilih salah satu jawaban.";
+
+        getElement("options").innerHTML = "";
+
+        getElement("leaderboard").innerHTML = "";
+
+        log("Keluar dari room.");
+
+        isLeaving = false;
+
+    }
+
+    // ======================================
+    // ENTER KEY
+    // ======================================
+
+    getElement("nickname").addEventListener("keydown", event => {
+
+        if (event.key === "Enter") {
+
+            createRoom();
+
+        }
+
+    });
+
+    getElement("roomCode").addEventListener("keydown", event => {
+
+        if (event.key === "Enter") {
+
+            joinRoom();
+
+        }
+
+    });
+
+    // ======================================
+    // INITIALIZATION
+    // ======================================
+
+    log("Halaman Multiplayer siap digunakan.");
+
+    log("Backend: " + API_URL);
+
+</script>
+
+</body>
+</html>
