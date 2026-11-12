@@ -15,19 +15,25 @@ const app = express();
 const httpServer = createServer(app);
 
 const PORT = Number(process.env.PORT || 3000);
+const HOST = "0.0.0.0";
 
 const io = new Server(httpServer, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
   },
+  transports: ["websocket", "polling"],
 });
 
 // ==========================================
 // MIDDLEWARE
 // ==========================================
 
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -39,6 +45,7 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     message: "Informatics Quiz Arena Backend aktif!",
+    status: "online",
   });
 });
 
@@ -47,6 +54,7 @@ app.get("/health", (req, res) => {
     success: true,
     message: "Informatics Quiz Arena Backend aktif!",
     status: "online",
+    socket_io: "active",
   });
 });
 
@@ -56,7 +64,6 @@ app.use("/api/rooms", roomRoutes);
 
 // ==========================================
 // JSON 404 HANDLER
-// Harus diletakkan setelah semua REST routes.
 // ==========================================
 
 app.use((req, res) => {
@@ -106,9 +113,7 @@ async function getRoomState(roomId) {
     [roomId]
   );
 
-  if (rooms.length === 0) {
-    return null;
-  }
+  if (rooms.length === 0) return null;
 
   const [players] = await db.execute(
     `SELECT
@@ -160,9 +165,7 @@ async function publishCurrentQuestion(roomId) {
       [roomId]
     );
 
-    if (rooms.length === 0 || rooms[0].status !== "playing") {
-      return;
-    }
+    if (rooms.length === 0 || rooms[0].status !== "playing") return;
 
     const room = rooms[0];
     const questionOrder = Number(room.current_question_index) + 1;
@@ -221,14 +224,11 @@ async function publishCurrentQuestion(roomId) {
 
     const oldTimer = gameTimers.get(roomId);
 
-    if (oldTimer) {
-      clearTimeout(oldTimer);
-    }
+    if (oldTimer) clearTimeout(oldTimer);
 
     const timer = setTimeout(async () => {
       gameTimers.delete(roomId);
       activeQuestionEndsAt.delete(roomId);
-
       await advanceGame(roomId);
     }, duration * 1000);
 
@@ -257,9 +257,7 @@ async function advanceGame(roomId) {
       [roomId]
     );
 
-    if (rooms.length === 0 || rooms[0].status !== "playing") {
-      return;
-    }
+    if (rooms.length === 0 || rooms[0].status !== "playing") return;
 
     const room = rooms[0];
     const nextIndex = Number(room.current_question_index) + 1;
@@ -336,10 +334,6 @@ async function finishGame(roomId) {
 
 io.on("connection", (socket) => {
   console.log("Socket terhubung:", socket.id);
-
-  // ========================================
-  // PLAYER JOIN ROOM
-  // ========================================
 
   socket.on("room:join", async (data) => {
     try {
@@ -425,7 +419,6 @@ io.on("connection", (socket) => {
 
       await publishRoomState(room.id);
 
-      // Sinkronisasi soal jika pemain masuk saat kuis berjalan.
       if (room.status === "playing") {
         const [activeRooms] = await db.execute(
           `SELECT
@@ -440,7 +433,6 @@ io.on("connection", (socket) => {
 
         if (activeRooms.length > 0) {
           const activeRoom = activeRooms[0];
-
           const questionOrder =
             Number(activeRoom.current_question_index) + 1;
 
@@ -490,37 +482,25 @@ io.on("connection", (socket) => {
 
     } catch (error) {
       console.error("room:join error:", error);
-
       socket.emit("room:error", {
         message: "Gagal bergabung ke room",
       });
     }
   });
 
-  // ========================================
-  // ROOM SYNC
-  // ========================================
-
   socket.on("room:sync", async () => {
     try {
       const roomId = socket.data.roomId;
-
       if (!roomId) return;
 
       const state = await getRoomState(roomId);
 
-      if (state) {
-        socket.emit("room:updated", state);
-      }
+      if (state) socket.emit("room:updated", state);
 
     } catch (error) {
       console.error("room:sync error:", error);
     }
   });
-
-  // ========================================
-  // PLAYER LEAVE ROOM
-  // ========================================
 
   socket.on("room:leave", async () => {
     try {
@@ -555,10 +535,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ========================================
-  // HOST START GAME
-  // ========================================
-
   socket.on("game:start", async () => {
     let connection;
     let transactionStarted = false;
@@ -587,9 +563,7 @@ io.on("connection", (socket) => {
         [roomId]
       );
 
-      if (rooms.length === 0) {
-        throw new Error("Room tidak ditemukan");
-      }
+      if (rooms.length === 0) throw new Error("Room tidak ditemukan");
 
       const room = rooms[0];
 
@@ -605,10 +579,7 @@ io.on("connection", (socket) => {
         [playerId, roomId]
       );
 
-      if (
-        players.length === 0 ||
-        Number(players[0].is_host) !== 1
-      ) {
+      if (players.length === 0 || Number(players[0].is_host) !== 1) {
         throw new Error("Hanya host yang dapat memulai kuis");
       }
 
@@ -637,7 +608,6 @@ io.on("connection", (socket) => {
         throw new Error("Jumlah soal di database tidak mencukupi");
       }
 
-      // Simpan soal untuk room ini.
       for (let i = 0; i < questions.length; i++) {
         const [result] = await connection.execute(
           `INSERT INTO room_questions
@@ -702,15 +672,9 @@ io.on("connection", (socket) => {
       });
 
     } finally {
-      if (connection) {
-        connection.release();
-      }
+      if (connection) connection.release();
     }
   });
-
-  // ========================================
-  // PLAYER SUBMIT ANSWER
-  // ========================================
 
   socket.on("game:submit_answer", async (data) => {
     let connection;
@@ -769,7 +733,6 @@ io.on("connection", (socket) => {
         throw new Error("Waktu menjawab sudah habis");
       }
 
-      // Ambil soal aktif.
       const [questions] = await connection.execute(
         `SELECT
           rq.id AS room_question_id,
@@ -789,7 +752,6 @@ io.on("connection", (socket) => {
 
       const question = questions[0];
 
-      // Validasi pilihan jawaban.
       const [options] = await connection.execute(
         `SELECT qo.id, qo.is_correct
          FROM room_question_options rqo
@@ -805,7 +767,6 @@ io.on("connection", (socket) => {
         throw new Error("Pilihan tidak sesuai dengan soal aktif");
       }
 
-      // Cegah jawaban ganda.
       const [existingAnswers] = await connection.execute(
         `SELECT id
          FROM game_answers
@@ -825,10 +786,7 @@ io.on("connection", (socket) => {
       const durationMs =
         Number(room.time_per_question) * 1000;
 
-      const remainingMs = Math.max(
-        0,
-        endsAt - Date.now()
-      );
+      const remainingMs = Math.max(0, endsAt - Date.now());
 
       const answerTimeMs = Math.min(
         durationMs,
@@ -839,11 +797,8 @@ io.on("connection", (socket) => {
         ? Math.floor((remainingMs / durationMs) * 500)
         : 0;
 
-      const points = isCorrect
-        ? 1000 + speedBonus
-        : 0;
+      const points = isCorrect ? 1000 + speedBonus : 0;
 
-      // Simpan jawaban.
       await connection.execute(
         `INSERT INTO game_answers
          (
@@ -868,7 +823,6 @@ io.on("connection", (socket) => {
         ]
       );
 
-      // Perbarui skor.
       await connection.execute(
         `UPDATE room_players
          SET score = score + ?
@@ -884,12 +838,9 @@ io.on("connection", (socket) => {
         is_correct: isCorrect,
         points,
         explanation: question.explanation,
-        message: isCorrect
-          ? "Jawaban benar!"
-          : "Jawaban belum tepat",
+        message: isCorrect ? "Jawaban benar!" : "Jawaban belum tepat",
       });
 
-      // Kirim leaderboard terbaru.
       const [leaderboard] = await db.execute(
         `SELECT
           id AS player_id,
@@ -925,15 +876,9 @@ io.on("connection", (socket) => {
       });
 
     } finally {
-      if (connection) {
-        connection.release();
-      }
+      if (connection) connection.release();
     }
   });
-
-  // ========================================
-  // SOCKET DISCONNECT
-  // ========================================
 
   socket.on("disconnect", async () => {
     console.log("Socket terputus:", socket.id);
@@ -970,11 +915,11 @@ io.on("connection", (socket) => {
 // START SERVER
 // ==========================================
 
-httpServer.listen(PORT, async () => {
+httpServer.listen(PORT, HOST, async () => {
   console.log("----------------------------------");
   console.log("INFORMATICS QUIZ ARENA BACKEND");
-  console.log(`Server berjalan di port ${PORT}`);
-  console.log(`URL: http://localhost:${PORT}`);
+  console.log(`Server berjalan pada ${HOST}:${PORT}`);
+  console.log(`Port: ${PORT}`);
   console.log("Health Check: /health");
   console.log("Socket.IO: Aktif");
   console.log("Game Start: Aktif");
@@ -984,3 +929,4 @@ httpServer.listen(PORT, async () => {
 
   await testDatabaseConnection();
 });
+
