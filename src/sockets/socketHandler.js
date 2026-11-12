@@ -19,10 +19,21 @@ export default function registerSocketHandlers(io) {
                     return;
                 }
 
-                const cleanRoomCode = String(room_code).trim().toUpperCase();
+                const cleanRoomCode = String(room_code)
+                    .trim()
+                    .toUpperCase();
 
-                // Validasi pemain dan room di database
-                const [players] = await db.execute(
+                const parsedPlayerId = Number(player_id);
+
+                if (!Number.isInteger(parsedPlayerId) || parsedPlayerId < 1) {
+                    socket.emit("room_error", {
+                        message: "Player ID tidak valid"
+                    });
+                    return;
+                }
+
+                // Validasi pemain dan room di PostgreSQL.
+                const playerResult = await db.query(
                     `SELECT
                         rp.id,
                         rp.room_id,
@@ -33,20 +44,20 @@ export default function registerSocketHandlers(io) {
                         gr.status
                     FROM room_players rp
                     JOIN game_rooms gr ON gr.id = rp.room_id
-                    WHERE rp.id = ?
-                    AND gr.room_code = ?
-                    AND rp.is_connected = 1`,
-                    [player_id, cleanRoomCode]
+                    WHERE rp.id = $1
+                    AND gr.room_code = $2
+                    AND rp.is_connected = TRUE`,
+                    [parsedPlayerId, cleanRoomCode]
                 );
 
-                if (players.length === 0) {
+                if (playerResult.rows.length === 0) {
                     socket.emit("room_error", {
                         message: "Pemain atau room tidak ditemukan"
                     });
                     return;
                 }
 
-                const player = players[0];
+                const player = playerResult.rows[0];
 
                 if (player.status !== "waiting") {
                     socket.emit("room_error", {
@@ -55,16 +66,16 @@ export default function registerSocketHandlers(io) {
                     return;
                 }
 
-                // Hubungkan socket dengan pemain
-                await db.execute(
+                // Hubungkan socket dengan pemain.
+                await db.query(
                     `UPDATE room_players
-                     SET socket_id = ?
-                     WHERE id = ?`,
+                     SET socket_id = $1
+                     WHERE id = $2`,
                     [socket.id, player.id]
                 );
 
-                // Masukkan socket ke dalam room Socket.IO
-                socket.join(cleanRoomCode);
+                // Masukkan socket ke room Socket.IO.
+                await socket.join(cleanRoomCode);
 
                 socket.data.playerId = player.id;
                 socket.data.roomCode = cleanRoomCode;
@@ -80,17 +91,23 @@ export default function registerSocketHandlers(io) {
                     }
                 });
 
-                // Ambil daftar pemain terbaru
-                const [roomPlayers] = await db.execute(
-                    `SELECT id, nickname, score, is_host
-                     FROM room_players
-                     WHERE room_id = ?
-                     AND is_connected = 1
-                     ORDER BY joined_at ASC`,
+                // Ambil daftar pemain terbaru.
+                const roomPlayersResult = await db.query(
+                    `SELECT
+                        id,
+                        nickname,
+                        score,
+                        is_host
+                    FROM room_players
+                    WHERE room_id = $1
+                    AND is_connected = TRUE
+                    ORDER BY joined_at ASC`,
                     [player.room_id]
                 );
 
-                // Kirim daftar pemain ke semua anggota room
+                const roomPlayers = roomPlayersResult.rows;
+
+                // Kirim daftar pemain ke semua anggota room.
                 io.to(cleanRoomCode).emit("room_players_updated", {
                     total_players: roomPlayers.length,
                     players: roomPlayers
@@ -109,6 +126,7 @@ export default function registerSocketHandlers(io) {
             }
         });
 
+
         // ========================================
         // PEMAIN TERPUTUS
         // ========================================
@@ -118,12 +136,14 @@ export default function registerSocketHandlers(io) {
                 const roomCode = socket.data.roomCode;
 
                 if (playerId) {
-                    await db.execute(
+                    // Update status pemain yang terputus.
+                    const updateResult = await db.query(
                         `UPDATE room_players
-                         SET is_connected = 0,
+                         SET is_connected = FALSE,
                              socket_id = NULL
-                         WHERE id = ?
-                         AND socket_id = ?`,
+                         WHERE id = $1
+                         AND socket_id = $2
+                         RETURNING room_id`,
                         [playerId, socket.id]
                     );
 
@@ -131,18 +151,23 @@ export default function registerSocketHandlers(io) {
                         "Pemain terputus dari room: " + roomCode
                     );
 
-                    if (roomCode) {
-                        const [roomPlayers] = await db.execute(
-                            `SELECT id, nickname, score, is_host
+                    if (roomCode && updateResult.rows.length > 0) {
+                        const roomId = updateResult.rows[0].room_id;
+
+                        const roomPlayersResult = await db.query(
+                            `SELECT
+                                id,
+                                nickname,
+                                score,
+                                is_host
                              FROM room_players
-                             WHERE room_id = (
-                                 SELECT id FROM game_rooms
-                                 WHERE room_code = ?
-                             )
-                             AND is_connected = 1
+                             WHERE room_id = $1
+                             AND is_connected = TRUE
                              ORDER BY joined_at ASC`,
-                            [roomCode]
+                            [roomId]
                         );
+
+                        const roomPlayers = roomPlayersResult.rows;
 
                         io.to(roomCode).emit("room_players_updated", {
                             total_players: roomPlayers.length,

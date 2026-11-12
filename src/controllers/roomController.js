@@ -2,7 +2,9 @@
 import db from "../config/database.js";
 import { randomInt } from "crypto";
 
-// Membuat kode room acak 6 karakter.
+// ========================================
+// GENERATE KODE ROOM
+// ========================================
 function generateRoomCode() {
     const characters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let code = "";
@@ -14,10 +16,17 @@ function generateRoomCode() {
     return code;
 }
 
+
+// ========================================
 // POST /api/rooms
-// Membuat room baru dan menjadikan pembuatnya sebagai host.
+// MEMBUAT ROOM BARU
+// ========================================
 export const createRoom = async (req, res) => {
-    const { nickname, question_count = 25, time_per_question = 20 } = req.body;
+    const {
+        nickname,
+        question_count = 25,
+        time_per_question = 20
+    } = req.body;
 
     if (!nickname || typeof nickname !== "string" || !nickname.trim()) {
         return res.status(400).json({
@@ -38,76 +47,111 @@ export const createRoom = async (req, res) => {
     const questionCount = Number(question_count);
     const timePerQuestion = Number(time_per_question);
 
-    if (!Number.isInteger(questionCount) || questionCount < 1 || questionCount > 50) {
+    if (
+        !Number.isInteger(questionCount) ||
+        questionCount < 1 ||
+        questionCount > 50
+    ) {
         return res.status(400).json({
             success: false,
             message: "Jumlah soal harus antara 1 sampai 50"
         });
     }
 
-    if (!Number.isInteger(timePerQuestion) || timePerQuestion < 5 || timePerQuestion > 120) {
+    if (
+        !Number.isInteger(timePerQuestion) ||
+        timePerQuestion < 5 ||
+        timePerQuestion > 120
+    ) {
         return res.status(400).json({
             success: false,
             message: "Waktu per soal harus antara 5 sampai 120 detik"
         });
     }
 
-    const connection = await db.getConnection();
+    let client;
 
     try {
-        await connection.beginTransaction();
+        client = await db.connect();
 
-        let roomId;
+        await client.query("BEGIN");
+
+        let room;
         let roomCode;
-        let roomCreated = false;
 
-        // Coba membuat kode room sampai maksimal 5 kali.
+        // Coba membuat kode room unik maksimal 5 kali.
         for (let attempt = 0; attempt < 5; attempt++) {
             roomCode = generateRoomCode();
 
             try {
-                const [result] = await connection.execute(
+                const roomResult = await client.query(
                     `INSERT INTO game_rooms
-                    (room_code, status, max_players, question_count, time_per_question, current_question_index)
-                    VALUES (?, 'waiting', 50, ?, ?, 0)`,
+                    (
+                        room_code,
+                        status,
+                        max_players,
+                        question_count,
+                        time_per_question,
+                        current_question_index
+                    )
+                    VALUES ($1, 'waiting', 50, $2, $3, 0)
+                    RETURNING id`,
                     [roomCode, questionCount, timePerQuestion]
                 );
 
-                roomId = result.insertId;
-                roomCreated = true;
+                room = roomResult.rows[0];
                 break;
+
             } catch (error) {
-                if (error.code !== "ER_DUP_ENTRY") {
+                // PostgreSQL unique violation
+                if (error.code !== "23505") {
                     throw error;
                 }
+
+                // Setelah unique violation, transaksi PostgreSQL
+                // berada dalam kondisi aborted.
+                await client.query("ROLLBACK");
+                await client.query("BEGIN");
             }
         }
 
-        if (!roomCreated) {
-            throw new Error("Gagal membuat kode room unik. Silakan coba lagi.");
+        if (!room) {
+            throw new Error(
+                "Gagal membuat kode room unik. Silakan coba lagi."
+            );
         }
 
-        const [playerResult] = await connection.execute(
+        const playerResult = await client.query(
             `INSERT INTO room_players
-            (room_id, nickname, socket_id, score, is_host, is_connected)
-            VALUES (?, ?, NULL, 0, 1, 1)`,
-            [roomId, cleanNickname]
+            (
+                room_id,
+                nickname,
+                socket_id,
+                score,
+                is_host,
+                is_connected
+            )
+            VALUES ($1, $2, NULL, 0, TRUE, TRUE)
+            RETURNING id`,
+            [room.id, cleanNickname]
         );
 
-        await connection.commit();
+        const player = playerResult.rows[0];
+
+        await client.query("COMMIT");
 
         return res.status(201).json({
             success: true,
             message: "Room berhasil dibuat",
             data: {
-                room_id: roomId,
+                room_id: room.id,
                 room_code: roomCode,
                 status: "waiting",
                 max_players: 50,
                 question_count: questionCount,
                 time_per_question: timePerQuestion,
                 player: {
-                    player_id: playerResult.insertId,
+                    player_id: player.id,
                     nickname: cleanNickname,
                     is_host: true,
                     score: 0
@@ -116,7 +160,13 @@ export const createRoom = async (req, res) => {
         });
 
     } catch (error) {
-        await connection.rollback();
+        if (client) {
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Rollback error:", rollbackError.message);
+            }
+        }
 
         console.error("Error createRoom:", error);
 
@@ -126,13 +176,17 @@ export const createRoom = async (req, res) => {
         });
 
     } finally {
-        connection.release();
+        if (client) {
+            client.release();
+        }
     }
 };
 
 
+// ========================================
 // POST /api/rooms/join
-// Bergabung ke room menggunakan kode room.
+// BERGABUNG KE ROOM
+// ========================================
 export const joinRoom = async (req, res) => {
     const { room_code, nickname } = req.body;
 
@@ -160,23 +214,30 @@ export const joinRoom = async (req, res) => {
         });
     }
 
-    const connection = await db.getConnection();
+    let client;
 
     try {
-        await connection.beginTransaction();
+        client = await db.connect();
 
-        // Kunci data room sementara agar kapasitas tidak terlampaui
-        // ketika beberapa pemain bergabung bersamaan.
-        const [rooms] = await connection.execute(
-            `SELECT id, room_code, status, max_players, question_count, time_per_question
+        await client.query("BEGIN");
+
+        // Kunci data room agar kapasitas tidak terlampaui.
+        const roomResult = await client.query(
+            `SELECT
+                id,
+                room_code,
+                status,
+                max_players,
+                question_count,
+                time_per_question
              FROM game_rooms
-             WHERE room_code = ?
+             WHERE room_code = $1
              FOR UPDATE`,
             [cleanRoomCode]
         );
 
-        if (rooms.length === 0) {
-            await connection.rollback();
+        if (roomResult.rows.length === 0) {
+            await client.query("ROLLBACK");
 
             return res.status(404).json({
                 success: false,
@@ -184,10 +245,10 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        const room = rooms[0];
+        const room = roomResult.rows[0];
 
         if (room.status !== "waiting") {
-            await connection.rollback();
+            await client.query("ROLLBACK");
 
             return res.status(400).json({
                 success: false,
@@ -195,18 +256,21 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        // Hitung pemain yang sedang terdaftar aktif.
-        const [playerCounts] = await connection.execute(
+        // Hitung pemain aktif.
+        const playerCountResult = await client.query(
             `SELECT COUNT(*) AS total_players
              FROM room_players
-             WHERE room_id = ? AND is_connected = 1`,
+             WHERE room_id = $1
+             AND is_connected = TRUE`,
             [room.id]
         );
 
-        const totalPlayers = Number(playerCounts[0].total_players);
+        const totalPlayers = Number(
+            playerCountResult.rows[0].total_players
+        );
 
         if (totalPlayers >= room.max_players) {
-            await connection.rollback();
+            await client.query("ROLLBACK");
 
             return res.status(400).json({
                 success: false,
@@ -214,18 +278,18 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        // Cegah dua pemain aktif menggunakan nickname yang sama.
-        const [existingPlayers] = await connection.execute(
+        // Cek nickname yang sedang digunakan.
+        const existingPlayerResult = await client.query(
             `SELECT id
              FROM room_players
-             WHERE room_id = ?
-             AND LOWER(nickname) = LOWER(?)
-             AND is_connected = 1`,
+             WHERE room_id = $1
+             AND LOWER(nickname) = LOWER($2)
+             AND is_connected = TRUE`,
             [room.id, cleanNickname]
         );
 
-        if (existingPlayers.length > 0) {
-            await connection.rollback();
+        if (existingPlayerResult.rows.length > 0) {
+            await client.query("ROLLBACK");
 
             return res.status(409).json({
                 success: false,
@@ -233,14 +297,25 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        const [playerResult] = await connection.execute(
+        // Tambahkan pemain baru.
+        const playerResult = await client.query(
             `INSERT INTO room_players
-            (room_id, nickname, socket_id, score, is_host, is_connected)
-            VALUES (?, ?, NULL, 0, 0, 1)`,
+            (
+                room_id,
+                nickname,
+                socket_id,
+                score,
+                is_host,
+                is_connected
+            )
+            VALUES ($1, $2, NULL, 0, FALSE, TRUE)
+            RETURNING id`,
             [room.id, cleanNickname]
         );
 
-        await connection.commit();
+        const player = playerResult.rows[0];
+
+        await client.query("COMMIT");
 
         return res.status(201).json({
             success: true,
@@ -254,7 +329,7 @@ export const joinRoom = async (req, res) => {
                 time_per_question: room.time_per_question,
                 total_players: totalPlayers + 1,
                 player: {
-                    player_id: playerResult.insertId,
+                    player_id: player.id,
                     nickname: cleanNickname,
                     is_host: false,
                     score: 0
@@ -263,7 +338,13 @@ export const joinRoom = async (req, res) => {
         });
 
     } catch (error) {
-        await connection.rollback();
+        if (client) {
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Rollback error:", rollbackError.message);
+            }
+        }
 
         console.error("Error joinRoom:", error);
 
@@ -273,6 +354,8 @@ export const joinRoom = async (req, res) => {
         });
 
     } finally {
-        connection.release();
+        if (client) {
+            client.release();
+        }
     }
 };

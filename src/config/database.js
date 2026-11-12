@@ -1,35 +1,51 @@
 
-import mysql from "mysql2/promise";
+import pg from "pg";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-const db = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: Number(process.env.DB_PORT || 3306),
+const { Pool } = pg;
 
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+// Koneksi PostgreSQL Neon
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
 // Fungsi untuk mengetes koneksi database
 export async function testDatabaseConnection() {
+  let client;
+
   try {
-    const connection = await db.getConnection();
+    client = await db.connect();
 
-    console.log("MySQL berhasil terhubung!");
-    console.log("Database: " + process.env.DB_NAME);
+    const result = await client.query(
+      "SELECT current_database() AS database, NOW() AS server_time"
+    );
 
-    connection.release();
+    console.log("PostgreSQL Neon berhasil terhubung!");
+    console.log("Database:", result.rows[0].database);
+    console.log("Waktu server:", result.rows[0].server_time);
+
     return true;
   } catch (error) {
-    console.error("Koneksi MySQL gagal:", error.message);
+    console.error("Koneksi PostgreSQL gagal:", error.message);
     return false;
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
+
+// Menangani error koneksi idle
+db.on("error", (error) => {
+  console.error("PostgreSQL Pool Error:", error.message);
+});
 
 export default db;

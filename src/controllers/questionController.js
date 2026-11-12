@@ -6,7 +6,7 @@ import db from "../config/database.js";
 // ========================================
 export const getCategories = async (req, res) => {
     try {
-        const [categories] = await db.query(`
+        const result = await db.query(`
             SELECT
                 id,
                 name,
@@ -18,7 +18,7 @@ export const getCategories = async (req, res) => {
         res.status(200).json({
             success: true,
             message: "Data kategori berhasil diambil",
-            data: categories
+            data: result.rows
         });
 
     } catch (error) {
@@ -45,9 +45,11 @@ export const getQuestions = async (req, res) => {
 
         const parsedLimit = Number.parseInt(limit, 10);
 
-        if (!Number.isInteger(parsedLimit) ||
+        if (
+            !Number.isInteger(parsedLimit) ||
             parsedLimit < 1 ||
-            parsedLimit > 50) {
+            parsedLimit > 50
+        ) {
             return res.status(400).json({
                 success: false,
                 message: "Limit harus berupa angka 1 sampai 50"
@@ -76,8 +78,8 @@ export const getQuestions = async (req, res) => {
                 });
             }
 
-            sql += " AND category_id = ?";
             params.push(categoryId);
+            sql += ` AND category_id = $${params.length}`;
         }
 
         if (difficulty !== undefined) {
@@ -90,14 +92,15 @@ export const getQuestions = async (req, res) => {
                 });
             }
 
-            sql += " AND difficulty = ?";
             params.push(difficulty);
+            sql += ` AND difficulty = $${params.length}`;
         }
 
-        sql += " ORDER BY id ASC LIMIT ?";
         params.push(parsedLimit);
+        sql += ` ORDER BY id ASC LIMIT $${params.length}`;
 
-        const [questions] = await db.execute(sql, params);
+        const questionResult = await db.query(sql, params);
+        const questions = questionResult.rows;
 
         if (questions.length === 0) {
             return res.status(200).json({
@@ -110,9 +113,12 @@ export const getQuestions = async (req, res) => {
 
         const questionIds = questions.map(question => question.id);
 
-        const placeholders = questionIds.map(() => "?").join(",");
+        // Membuat placeholder PostgreSQL: $1, $2, $3, ...
+        const placeholders = questionIds
+            .map((_, index) => `$${index + 1}`)
+            .join(",");
 
-        const [options] = await db.execute(
+        const optionResult = await db.query(
             `
                 SELECT
                     question_id,
@@ -125,10 +131,14 @@ export const getQuestions = async (req, res) => {
             questionIds
         );
 
+        const options = optionResult.rows;
+
         const result = questions.map(question => ({
             ...question,
             options: options
-                .filter(option => option.question_id === question.id)
+                .filter(option =>
+                    String(option.question_id) === String(question.id)
+                )
                 .map(option => ({
                     id: option.id,
                     option_text: option.option_text
