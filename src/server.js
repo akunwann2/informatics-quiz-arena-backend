@@ -1,4 +1,3 @@
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -100,13 +99,8 @@ app.use((error, req, res, next) => {
 // GAME TIMER
 // ==========================================
 
-// Menyimpan timer setiap room.
 const gameTimers = new Map();
-
-// Menyimpan waktu berakhirnya soal berdasarkan jam server.
 const activeQuestionEndsAt = new Map();
-
-// Mencegah dua proses memindahkan soal yang sama.
 const advancingRooms = new Set();
 
 // ==========================================
@@ -213,7 +207,6 @@ async function publishCurrentQuestion(roomId) {
         const questionOrder =
             Number(room.current_question_index) + 1;
 
-        // Ambil soal yang sudah disiapkan untuk room.
         const questionResult = await db.query(
             `SELECT
                 rq.id AS room_question_id,
@@ -237,7 +230,6 @@ async function publishCurrentQuestion(roomId) {
 
         const question = questionResult.rows[0];
 
-        // Ambil pilihan jawaban.
         const optionResult = await db.query(
             `SELECT
                 qo.id AS option_id,
@@ -252,14 +244,11 @@ async function publishCurrentQuestion(roomId) {
         );
 
         const duration = Number(room.time_per_question);
-
-        // Semua pemain menggunakan waktu akhir yang sama.
         const endsAt = Date.now() + duration * 1000;
 
         activeQuestionEndsAt.set(roomId, endsAt);
 
-        // Kirim soal ke seluruh pemain secara bersamaan.
-        // Tidak mengirim kunci jawaban atau penjelasan.
+        // Tidak mengirim kunci jawaban atau pembahasan.
         io.to(`room_${roomId}`).emit(
             "game:question_started",
             {
@@ -278,14 +267,12 @@ async function publishCurrentQuestion(roomId) {
             `Room ${roomId}: soal ${questionOrder} dimulai`
         );
 
-        // Bersihkan timer sebelumnya.
         const oldTimer = gameTimers.get(roomId);
 
         if (oldTimer) {
             clearTimeout(oldTimer);
         }
 
-        // Timer tetap berjalan meskipun pemain sudah menjawab.
         const timer = setTimeout(async () => {
             gameTimers.delete(roomId);
             activeQuestionEndsAt.delete(roomId);
@@ -308,7 +295,6 @@ async function publishCurrentQuestion(roomId) {
 // ==========================================
 
 async function advanceGame(roomId) {
-    // Hindari perpindahan soal ganda.
     if (advancingRooms.has(roomId)) {
         return;
     }
@@ -340,13 +326,11 @@ async function advanceGame(roomId) {
         const nextIndex =
             Number(room.current_question_index) + 1;
 
-        // Jika seluruh soal sudah selesai.
         if (nextIndex >= Number(room.question_count)) {
             await finishGame(roomId);
             return;
         }
 
-        // Perbarui indeks soal.
         await db.query(
             `UPDATE game_rooms
              SET current_question_index = $1
@@ -358,7 +342,6 @@ async function advanceGame(roomId) {
             ]
         );
 
-        // Langsung kirim soal berikutnya.
         await publishCurrentQuestion(roomId);
 
     } catch (error) {
@@ -380,8 +363,6 @@ async function finishGame(roomId) {
     try {
         clearRoomTimer(roomId);
 
-        // Tandai pertandingan selesai.
-        // RETURNING mencegah pengiriman hasil berulang.
         const finishResult = await db.query(
             `UPDATE game_rooms
              SET status = 'finished',
@@ -392,12 +373,11 @@ async function finishGame(roomId) {
             [roomId]
         );
 
-        // Jika room sudah selesai sebelumnya, hentikan proses.
         if (finishResult.rows.length === 0) {
             return;
         }
 
-        // Ambil leaderboard akhir.
+        // Leaderboard akhir.
         const leaderboardResult = await db.query(
             `SELECT
                 id AS player_id,
@@ -410,12 +390,11 @@ async function finishGame(roomId) {
             [roomId]
         );
 
-        // Ambil semua socket pemain yang berada di room.
+        // Ambil socket pemain di room.
         const sockets = await io
             .in(`room_${roomId}`)
             .fetchSockets();
 
-        // Kirim riwayat jawaban secara pribadi ke setiap pemain.
         for (const playerSocket of sockets) {
             const playerId = Number(
                 playerSocket.data.playerId
@@ -428,14 +407,15 @@ async function finishGame(roomId) {
                 continue;
             }
 
+            // Hanya mengambil jawaban salah milik pemain ini.
             const reviewResult = await db.query(
                 `SELECT
                     rq.question_order,
                     q.id AS question_id,
                     q.question_text,
-                    q.explanation,
                     selected.option_text AS selected_answer,
                     correct.option_text AS correct_answer,
+                    q.explanation,
                     ga.is_correct,
                     ga.points
                  FROM game_answers ga
@@ -444,13 +424,14 @@ async function finishGame(roomId) {
                  INNER JOIN room_questions rq
                     ON rq.room_id = ga.room_id
                    AND rq.question_id = ga.question_id
-                 INNER JOIN question_options selected
+                 LEFT JOIN question_options selected
                     ON selected.id = ga.selected_option_id
                  INNER JOIN question_options correct
                     ON correct.question_id = ga.question_id
                    AND correct.is_correct = TRUE
                  WHERE ga.room_id = $1
                    AND ga.player_id = $2
+                   AND ga.is_correct = FALSE
                  ORDER BY rq.question_order ASC`,
                 [
                     roomId,
@@ -458,12 +439,17 @@ async function finishGame(roomId) {
                 ]
             );
 
-            // Setiap pemain hanya menerima riwayat jawabannya sendiri.
             playerSocket.emit("game:finished", {
+                success: true,
                 message: "Kuis telah selesai!",
                 leaderboard: leaderboardResult.rows,
                 answer_reviews: reviewResult.rows,
             });
+
+            console.log(
+                `Room ${roomId}: hasil dikirim ke player ${playerId}. ` +
+                `Jumlah jawaban salah: ${reviewResult.rows.length}`
+            );
         }
 
         console.log(
@@ -477,7 +463,6 @@ async function finishGame(roomId) {
         );
     }
 }
-
 // ==========================================
 // SOCKET.IO
 // ==========================================
@@ -533,13 +518,7 @@ io.on("connection", (socket) => {
 
             const room = roomResult.rows[0];
 
-            if (room.status === "finished") {
-                socket.emit("room:error", {
-                    message: "Kuis sudah selesai",
-                });
-                return;
-            }
-
+            // Pemain tetap boleh masuk kembali ke room finished.
             const playerResult = await db.query(
                 `SELECT
                     id,
@@ -597,8 +576,72 @@ io.on("connection", (socket) => {
 
             await publishRoomState(room.id);
 
-            // Jika pemain masuk kembali saat game berlangsung,
-            // kirim soal aktif dan waktu akhir dari server.
+            // ======================================
+            // ROOM SUDAH SELESAI
+            // ======================================
+
+            if (room.status === "finished") {
+                const leaderboardResult = await db.query(
+                    `SELECT
+                        id AS player_id,
+                        nickname,
+                        score,
+                        is_host
+                     FROM room_players
+                     WHERE room_id = $1
+                     ORDER BY score DESC, joined_at ASC`,
+                    [room.id]
+                );
+
+                const reviewResult = await db.query(
+                    `SELECT
+                        rq.question_order,
+                        q.id AS question_id,
+                        q.question_text,
+                        selected.option_text AS selected_answer,
+                        correct.option_text AS correct_answer,
+                        q.explanation,
+                        ga.is_correct,
+                        ga.points
+                     FROM game_answers ga
+                     INNER JOIN questions q
+                        ON q.id = ga.question_id
+                     INNER JOIN room_questions rq
+                        ON rq.room_id = ga.room_id
+                       AND rq.question_id = ga.question_id
+                     LEFT JOIN question_options selected
+                        ON selected.id = ga.selected_option_id
+                     INNER JOIN question_options correct
+                        ON correct.question_id = ga.question_id
+                       AND correct.is_correct = TRUE
+                     WHERE ga.room_id = $1
+                       AND ga.player_id = $2
+                       AND ga.is_correct = FALSE
+                     ORDER BY rq.question_order ASC`,
+                    [
+                        room.id,
+                        playerId,
+                    ]
+                );
+
+                socket.emit("game:finished", {
+                    success: true,
+                    message: "Kuis telah selesai!",
+                    leaderboard: leaderboardResult.rows,
+                    answer_reviews: reviewResult.rows,
+                });
+
+                console.log(
+                    `Player ${playerId} mengambil kembali hasil Room ${room.id}`
+                );
+
+                return;
+            }
+
+            // ======================================
+            // PEMAIN MASUK KEMBALI SAAT GAME BERLANGSUNG
+            // ======================================
+
             if (room.status === "playing") {
                 const activeRoomResult = await db.query(
                     `SELECT
@@ -845,7 +888,6 @@ io.on("connection", (socket) => {
             const questionCount =
                 Number(room.question_count);
 
-            // Pilih soal secara acak.
             const questionResult = await client.query(
                 `SELECT id
                  FROM questions
@@ -862,8 +904,7 @@ io.on("connection", (socket) => {
                 );
             }
 
-            // Siapkan soal dan pilihan untuk room.
-            // Tidak ada DELETE FROM room_questions di sini.
+            // Siapkan soal dan pilihan jawaban untuk room.
             for (let i = 0; i < questions.length; i++) {
                 const roomQuestionResult =
                     await client.query(
@@ -941,7 +982,6 @@ io.on("connection", (socket) => {
                 `Room ${roomId}: game dimulai`
             );
 
-            // Publikasikan soal pertama.
             await publishCurrentQuestion(roomId);
 
         } catch (error) {
@@ -1002,8 +1042,6 @@ io.on("connection", (socket) => {
             await client.query("BEGIN");
             transactionStarted = true;
 
-            // Kunci data room agar proses jawaban
-            // tidak bertabrakan dengan perpindahan soal.
             const roomResult = await client.query(
                 `SELECT
                     id,
@@ -1031,7 +1069,6 @@ io.on("connection", (socket) => {
 
             const endsAt = activeQuestionEndsAt.get(roomId);
 
-            // Validasi waktu berdasarkan jam server.
             if (!endsAt || Date.now() >= endsAt) {
                 throw new Error("Waktu menjawab sudah habis");
             }
@@ -1066,7 +1103,10 @@ io.on("connection", (socket) => {
                  WHERE rqo.room_question_id = $1
                    AND qo.id = $2
                  LIMIT 1`,
-                [question.room_question_id, optionId]
+                [
+                    question.room_question_id,
+                    optionId,
+                ]
             );
 
             if (optionResult.rows.length === 0) {
@@ -1075,7 +1115,6 @@ io.on("connection", (socket) => {
                 );
             }
 
-            // Pastikan pemain belum menjawab soal ini.
             const existingAnswerResult = await client.query(
                 `SELECT id
                  FROM game_answers
@@ -1120,8 +1159,7 @@ io.on("connection", (socket) => {
                 ? 1000 + speedBonus
                 : 0;
 
-            // Simpan jawaban dan hasil penilaiannya ke database.
-            // Informasi ini tidak dikirim ke pemain saat pertandingan.
+            // Simpan jawaban pemain ke database.
             await client.query(
                 `INSERT INTO game_answers
                  (
@@ -1161,15 +1199,13 @@ io.on("connection", (socket) => {
             await client.query("COMMIT");
             transactionStarted = false;
 
-            // Respons netral.
-            // Tidak mengirim benar/salah, poin, atau penjelasan.
+            // Respons netral, tanpa informasi benar atau salah.
             socket.emit("game:answer_result", {
                 success: true,
                 message: "Jawaban berhasil dicatat.",
                 ends_at: endsAt,
             });
 
-            // Perbarui leaderboard semua pemain.
             const leaderboardResult = await db.query(
                 `SELECT
                     id AS player_id,
