@@ -16,6 +16,12 @@ function generateRoomCode() {
     return code;
 }
 
+// ========================================
+// VALIDASI BOOLEAN
+// ========================================
+function isValidBoolean(value) {
+    return typeof value === "boolean";
+}
 
 // ========================================
 // POST /api/rooms
@@ -25,7 +31,9 @@ export const createRoom = async (req, res) => {
     const {
         nickname,
         question_count = 25,
-        time_per_question = 20
+        time_per_question = 20,
+        enable_combo = false,
+        enable_powerup = false
     } = req.body;
 
     if (!nickname || typeof nickname !== "string" || !nickname.trim()) {
@@ -69,6 +77,16 @@ export const createRoom = async (req, res) => {
         });
     }
 
+    if (
+        !isValidBoolean(enable_combo) ||
+        !isValidBoolean(enable_powerup)
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "Pengaturan Combo dan Power-Up harus berupa boolean"
+        });
+    }
+
     let client;
 
     try {
@@ -79,39 +97,38 @@ export const createRoom = async (req, res) => {
         let room;
         let roomCode;
 
-        // Coba membuat kode room unik maksimal 5 kali.
+        
+        // Membuat kode room unik maksimal 5 kali.
         for (let attempt = 0; attempt < 5; attempt++) {
             roomCode = generateRoomCode();
 
-            try {
-                const roomResult = await client.query(
-                    `INSERT INTO game_rooms
-                    (
-                        room_code,
-                        status,
-                        max_players,
-                        question_count,
-                        time_per_question,
-                        current_question_index
-                    )
-                    VALUES ($1, 'waiting', 50, $2, $3, 0)
-                    RETURNING id`,
-                    [roomCode, questionCount, timePerQuestion]
-                );
+            const roomResult = await client.query(
+                `INSERT INTO game_rooms
+                (
+                    room_code,
+                    status,
+                    max_players,
+                    question_count,
+                    time_per_question,
+                    current_question_index,
+                    enable_combo,
+                    enable_powerup
+                )
+                VALUES ($1, 'waiting', 50, $2, $3, 0, $4, $5)
+                ON CONFLICT (room_code) DO NOTHING
+                RETURNING id`,
+                [
+                    roomCode,
+                    questionCount,
+                    timePerQuestion,
+                    enable_combo,
+                    enable_powerup
+                ]
+            );
 
+            if (roomResult.rows.length > 0) {
                 room = roomResult.rows[0];
                 break;
-
-            } catch (error) {
-                // PostgreSQL unique violation
-                if (error.code !== "23505") {
-                    throw error;
-                }
-
-                // Setelah unique violation, transaksi PostgreSQL
-                // berada dalam kondisi aborted.
-                await client.query("ROLLBACK");
-                await client.query("BEGIN");
             }
         }
 
@@ -120,6 +137,7 @@ export const createRoom = async (req, res) => {
                 "Gagal membuat kode room unik. Silakan coba lagi."
             );
         }
+
 
         const playerResult = await client.query(
             `INSERT INTO room_players
@@ -150,6 +168,16 @@ export const createRoom = async (req, res) => {
                 max_players: 50,
                 question_count: questionCount,
                 time_per_question: timePerQuestion,
+                enable_combo,
+                enable_powerup,
+                game_mode:
+                    enable_combo && enable_powerup
+                        ? "ultimate_battle"
+                        : enable_combo
+                            ? "combo_battle"
+                            : enable_powerup
+                                ? "power_battle"
+                                : "classic",
                 player: {
                     player_id: player.id,
                     nickname: cleanNickname,
@@ -181,7 +209,6 @@ export const createRoom = async (req, res) => {
         }
     }
 };
-
 
 // ========================================
 // POST /api/rooms/join
@@ -221,7 +248,6 @@ export const joinRoom = async (req, res) => {
 
         await client.query("BEGIN");
 
-        // Kunci data room agar kapasitas tidak terlampaui.
         const roomResult = await client.query(
             `SELECT
                 id,
@@ -229,7 +255,9 @@ export const joinRoom = async (req, res) => {
                 status,
                 max_players,
                 question_count,
-                time_per_question
+                time_per_question,
+                enable_combo,
+                enable_powerup
              FROM game_rooms
              WHERE room_code = $1
              FOR UPDATE`,
@@ -256,7 +284,6 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        // Hitung pemain aktif.
         const playerCountResult = await client.query(
             `SELECT COUNT(*) AS total_players
              FROM room_players
@@ -278,7 +305,6 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        // Cek nickname yang sedang digunakan.
         const existingPlayerResult = await client.query(
             `SELECT id
              FROM room_players
@@ -297,7 +323,6 @@ export const joinRoom = async (req, res) => {
             });
         }
 
-        // Tambahkan pemain baru.
         const playerResult = await client.query(
             `INSERT INTO room_players
             (
@@ -327,6 +352,16 @@ export const joinRoom = async (req, res) => {
                 max_players: room.max_players,
                 question_count: room.question_count,
                 time_per_question: room.time_per_question,
+                enable_combo: room.enable_combo,
+                enable_powerup: room.enable_powerup,
+                game_mode:
+                    room.enable_combo && room.enable_powerup
+                        ? "ultimate_battle"
+                        : room.enable_combo
+                            ? "combo_battle"
+                            : room.enable_powerup
+                                ? "power_battle"
+                                : "classic",
                 total_players: totalPlayers + 1,
                 player: {
                     player_id: player.id,
