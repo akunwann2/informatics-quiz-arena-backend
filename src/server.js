@@ -259,6 +259,7 @@ async function publishCurrentQuestion(roomId) {
         activeQuestionEndsAt.set(roomId, endsAt);
 
         // Kirim soal ke seluruh pemain secara bersamaan.
+        // Tidak mengirim kunci jawaban atau penjelasan.
         io.to(`room_${roomId}`).emit(
             "game:question_started",
             {
@@ -379,15 +380,24 @@ async function finishGame(roomId) {
     try {
         clearRoomTimer(roomId);
 
-        await db.query(
+        // Tandai pertandingan selesai.
+        // RETURNING mencegah pengiriman hasil berulang.
+        const finishResult = await db.query(
             `UPDATE game_rooms
              SET status = 'finished',
                  ended_at = NOW()
              WHERE id = $1
-               AND status = 'playing'`,
+               AND status = 'playing'
+             RETURNING id`,
             [roomId]
         );
 
+        // Jika room sudah selesai sebelumnya, hentikan proses.
+        if (finishResult.rows.length === 0) {
+            return;
+        }
+
+        // Ambil leaderboard akhir.
         const leaderboardResult = await db.query(
             `SELECT
                 id AS player_id,
@@ -400,13 +410,61 @@ async function finishGame(roomId) {
             [roomId]
         );
 
-        io.to(`room_${roomId}`).emit(
-            "game:finished",
-            {
+        // Ambil semua socket pemain yang berada di room.
+        const sockets = await io
+            .in(`room_${roomId}`)
+            .fetchSockets();
+
+        // Kirim riwayat jawaban secara pribadi ke setiap pemain.
+        for (const playerSocket of sockets) {
+            const playerId = Number(
+                playerSocket.data.playerId
+            );
+
+            if (
+                !Number.isInteger(playerId) ||
+                playerId <= 0
+            ) {
+                continue;
+            }
+
+            const reviewResult = await db.query(
+                `SELECT
+                    rq.question_order,
+                    q.id AS question_id,
+                    q.question_text,
+                    q.explanation,
+                    selected.option_text AS selected_answer,
+                    correct.option_text AS correct_answer,
+                    ga.is_correct,
+                    ga.points
+                 FROM game_answers ga
+                 INNER JOIN questions q
+                    ON q.id = ga.question_id
+                 INNER JOIN room_questions rq
+                    ON rq.room_id = ga.room_id
+                   AND rq.question_id = ga.question_id
+                 INNER JOIN question_options selected
+                    ON selected.id = ga.selected_option_id
+                 INNER JOIN question_options correct
+                    ON correct.question_id = ga.question_id
+                   AND correct.is_correct = TRUE
+                 WHERE ga.room_id = $1
+                   AND ga.player_id = $2
+                 ORDER BY rq.question_order ASC`,
+                [
+                    roomId,
+                    playerId,
+                ]
+            );
+
+            // Setiap pemain hanya menerima riwayat jawabannya sendiri.
+            playerSocket.emit("game:finished", {
                 message: "Kuis telah selesai!",
                 leaderboard: leaderboardResult.rows,
-            }
-        );
+                answer_reviews: reviewResult.rows,
+            });
+        }
 
         console.log(
             `Room ${roomId}: kuis selesai`
@@ -910,9 +968,6 @@ io.on("connection", (socket) => {
         }
     });
 
-    // BAGIAN 2 DIMULAI DI SINI:
-    // GAME SUBMIT ANSWER
-
     // ======================================
     // GAME SUBMIT ANSWER
     // ======================================
@@ -1065,6 +1120,8 @@ io.on("connection", (socket) => {
                 ? 1000 + speedBonus
                 : 0;
 
+            // Simpan jawaban dan hasil penilaiannya ke database.
+            // Informasi ini tidak dikirim ke pemain saat pertandingan.
             await client.query(
                 `INSERT INTO game_answers
                  (
@@ -1104,16 +1161,11 @@ io.on("connection", (socket) => {
             await client.query("COMMIT");
             transactionStarted = false;
 
-            // Jawaban hanya dikunci untuk pemain ini.
-            // Timer room TIDAK dihentikan.
+            // Respons netral.
+            // Tidak mengirim benar/salah, poin, atau penjelasan.
             socket.emit("game:answer_result", {
                 success: true,
-                is_correct: isCorrect,
-                points,
-                explanation: question.explanation,
-                message: isCorrect
-                    ? "Jawaban benar!"
-                    : "Jawaban belum tepat",
+                message: "Jawaban berhasil dicatat.",
                 ends_at: endsAt,
             });
 
@@ -1139,7 +1191,7 @@ io.on("connection", (socket) => {
             );
 
             console.log(
-                `Pemain ${playerId} menjawab soal ${questionOrder}: ${points} poin`
+                `Pemain ${playerId} menjawab soal ${questionOrder}. Jawaban tersimpan.`
             );
 
         } catch (error) {
@@ -1234,6 +1286,7 @@ async function startServer() {
             console.log("Game Start: Aktif");
             console.log("Game Answer: Aktif");
             console.log("Leaderboard: Aktif");
+            console.log("Answer Review: Aktif");
             console.log("Shared Server Timer: Aktif");
             console.log("Question Preloading: Aktif");
             console.log("----------------------------------");
