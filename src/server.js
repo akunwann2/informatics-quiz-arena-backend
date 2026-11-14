@@ -17,6 +17,10 @@ const httpServer = createServer(app);
 const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
 
+// ==========================================
+// SOCKET.IO CONFIGURATION
+// ==========================================
+
 const io = new Server(httpServer, {
     cors: {
         origin: "*",
@@ -31,7 +35,14 @@ const io = new Server(httpServer, {
 
 app.use(cors({
     origin: "*",
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods: [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
 }));
 
 app.use(express.json());
@@ -44,7 +55,7 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/", (req, res) => {
     res.json({
         success: true,
-        message: "Informatics Quiz Arena Backend aktif!",
+        message: "IF Quizz Backend aktif!",
         status: "online",
     });
 });
@@ -52,16 +63,13 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
     res.status(200).json({
         success: true,
-        message: "Informatics Quiz Arena Backend aktif!",
+        message: "IF Quizz Backend aktif!",
         status: "online",
         socket_io: "active",
     });
 });
 
-// Endpoint kategori dan soal
 app.use("/api", questionRoutes);
-
-// Endpoint room
 app.use("/api/rooms", roomRoutes);
 
 // ==========================================
@@ -92,8 +100,14 @@ app.use((error, req, res, next) => {
 // GAME TIMER
 // ==========================================
 
+// Menyimpan timer setiap room.
 const gameTimers = new Map();
+
+// Menyimpan waktu berakhirnya soal berdasarkan jam server.
 const activeQuestionEndsAt = new Map();
+
+// Mencegah dua proses memindahkan soal yang sama.
+const advancingRooms = new Set();
 
 // ==========================================
 // HELPER: ROOM STATE
@@ -146,8 +160,26 @@ async function publishRoomState(roomId) {
     const state = await getRoomState(roomId);
 
     if (state) {
-        io.to(`room_${roomId}`).emit("room:updated", state);
+        io.to(`room_${roomId}`).emit(
+            "room:updated",
+            state
+        );
     }
+}
+
+// ==========================================
+// HELPER: CLEAR ROOM TIMER
+// ==========================================
+
+function clearRoomTimer(roomId) {
+    const timer = gameTimers.get(roomId);
+
+    if (timer) {
+        clearTimeout(timer);
+        gameTimers.delete(roomId);
+    }
+
+    activeQuestionEndsAt.delete(roomId);
 }
 
 // ==========================================
@@ -177,8 +209,11 @@ async function publishCurrentQuestion(roomId) {
         }
 
         const room = roomResult.rows[0];
-        const questionOrder = Number(room.current_question_index) + 1;
 
+        const questionOrder =
+            Number(room.current_question_index) + 1;
+
+        // Ambil soal yang sudah disiapkan untuk room.
         const questionResult = await db.query(
             `SELECT
                 rq.id AS room_question_id,
@@ -202,6 +237,7 @@ async function publishCurrentQuestion(roomId) {
 
         const question = questionResult.rows[0];
 
+        // Ambil pilihan jawaban.
         const optionResult = await db.query(
             `SELECT
                 qo.id AS option_id,
@@ -216,39 +252,53 @@ async function publishCurrentQuestion(roomId) {
         );
 
         const duration = Number(room.time_per_question);
+
+        // Semua pemain menggunakan waktu akhir yang sama.
         const endsAt = Date.now() + duration * 1000;
 
         activeQuestionEndsAt.set(roomId, endsAt);
 
-        io.to(`room_${roomId}`).emit("game:question_started", {
-            question_number: questionOrder,
-            total_questions: Number(room.question_count),
-            question_id: question.question_id,
-            question_text: question.question_text,
-            difficulty: question.difficulty,
-            options: optionResult.rows,
-            duration,
-            ends_at: endsAt,
-        });
+        // Kirim soal ke seluruh pemain secara bersamaan.
+        io.to(`room_${roomId}`).emit(
+            "game:question_started",
+            {
+                question_number: questionOrder,
+                total_questions: Number(room.question_count),
+                question_id: question.question_id,
+                question_text: question.question_text,
+                difficulty: question.difficulty,
+                options: optionResult.rows,
+                duration,
+                ends_at: endsAt,
+            }
+        );
 
-        console.log(`Room ${roomId}: soal ${questionOrder} dimulai`);
+        console.log(
+            `Room ${roomId}: soal ${questionOrder} dimulai`
+        );
 
+        // Bersihkan timer sebelumnya.
         const oldTimer = gameTimers.get(roomId);
 
         if (oldTimer) {
             clearTimeout(oldTimer);
         }
 
+        // Timer tetap berjalan meskipun pemain sudah menjawab.
         const timer = setTimeout(async () => {
             gameTimers.delete(roomId);
             activeQuestionEndsAt.delete(roomId);
+
             await advanceGame(roomId);
         }, duration * 1000);
 
         gameTimers.set(roomId, timer);
 
     } catch (error) {
-        console.error("publishCurrentQuestion error:", error);
+        console.error(
+            "publishCurrentQuestion error:",
+            error
+        );
     }
 }
 
@@ -257,6 +307,13 @@ async function publishCurrentQuestion(roomId) {
 // ==========================================
 
 async function advanceGame(roomId) {
+    // Hindari perpindahan soal ganda.
+    if (advancingRooms.has(roomId)) {
+        return;
+    }
+
+    advancingRooms.add(roomId);
+
     try {
         const roomResult = await db.query(
             `SELECT
@@ -278,24 +335,39 @@ async function advanceGame(roomId) {
         }
 
         const room = roomResult.rows[0];
-        const nextIndex = Number(room.current_question_index) + 1;
 
+        const nextIndex =
+            Number(room.current_question_index) + 1;
+
+        // Jika seluruh soal sudah selesai.
         if (nextIndex >= Number(room.question_count)) {
             await finishGame(roomId);
             return;
         }
 
+        // Perbarui indeks soal.
         await db.query(
             `UPDATE game_rooms
              SET current_question_index = $1
-             WHERE id = $2`,
-            [nextIndex, roomId]
+             WHERE id = $2
+               AND status = 'playing'`,
+            [
+                nextIndex,
+                roomId,
+            ]
         );
 
+        // Langsung kirim soal berikutnya.
         await publishCurrentQuestion(roomId);
 
     } catch (error) {
-        console.error("advanceGame error:", error);
+        console.error(
+            "advanceGame error:",
+            error
+        );
+
+    } finally {
+        advancingRooms.delete(roomId);
     }
 }
 
@@ -305,20 +377,14 @@ async function advanceGame(roomId) {
 
 async function finishGame(roomId) {
     try {
-        const timer = gameTimers.get(roomId);
-
-        if (timer) {
-            clearTimeout(timer);
-            gameTimers.delete(roomId);
-        }
-
-        activeQuestionEndsAt.delete(roomId);
+        clearRoomTimer(roomId);
 
         await db.query(
             `UPDATE game_rooms
              SET status = 'finished',
                  ended_at = NOW()
-             WHERE id = $1`,
+             WHERE id = $1
+               AND status = 'playing'`,
             [roomId]
         );
 
@@ -334,15 +400,23 @@ async function finishGame(roomId) {
             [roomId]
         );
 
-        io.to(`room_${roomId}`).emit("game:finished", {
-            message: "Kuis telah selesai!",
-            leaderboard: leaderboardResult.rows,
-        });
+        io.to(`room_${roomId}`).emit(
+            "game:finished",
+            {
+                message: "Kuis telah selesai!",
+                leaderboard: leaderboardResult.rows,
+            }
+        );
 
-        console.log(`Room ${roomId}: kuis selesai`);
+        console.log(
+            `Room ${roomId}: kuis selesai`
+        );
 
     } catch (error) {
-        console.error("finishGame error:", error);
+        console.error(
+            "finishGame error:",
+            error
+        );
     }
 }
 
@@ -351,7 +425,10 @@ async function finishGame(roomId) {
 // ==========================================
 
 io.on("connection", (socket) => {
-    console.log("Socket terhubung:", socket.id);
+    console.log(
+        "Socket terhubung:",
+        socket.id
+    );
 
     // ======================================
     // ROOM JOIN
@@ -359,7 +436,9 @@ io.on("connection", (socket) => {
 
     socket.on("room:join", async (data) => {
         try {
-            const roomCode = String(data?.room_code || "")
+            const roomCode = String(
+                data?.room_code || ""
+            )
                 .trim()
                 .toUpperCase();
 
@@ -377,7 +456,10 @@ io.on("connection", (socket) => {
             }
 
             const roomResult = await db.query(
-                `SELECT id, room_code, status
+                `SELECT
+                    id,
+                    room_code,
+                    status
                  FROM game_rooms
                  WHERE room_code = $1
                  LIMIT 1`,
@@ -401,12 +483,18 @@ io.on("connection", (socket) => {
             }
 
             const playerResult = await db.query(
-                `SELECT id, nickname, is_host
+                `SELECT
+                    id,
+                    nickname,
+                    is_host
                  FROM room_players
                  WHERE id = $1
                    AND room_id = $2
                  LIMIT 1`,
-                [playerId, room.id]
+                [
+                    playerId,
+                    room.id,
+                ]
             );
 
             if (playerResult.rows.length === 0) {
@@ -427,7 +515,11 @@ io.on("connection", (socket) => {
                      is_connected = TRUE
                  WHERE id = $2
                    AND room_id = $3`,
-                [socket.id, playerId, room.id]
+                [
+                    socket.id,
+                    playerId,
+                    room.id,
+                ]
             );
 
             await socket.join(`room_${room.id}`);
@@ -447,6 +539,8 @@ io.on("connection", (socket) => {
 
             await publishRoomState(room.id);
 
+            // Jika pemain masuk kembali saat game berlangsung,
+            // kirim soal aktif dan waktu akhir dari server.
             if (room.status === "playing") {
                 const activeRoomResult = await db.query(
                     `SELECT
@@ -460,10 +554,13 @@ io.on("connection", (socket) => {
                 );
 
                 if (activeRoomResult.rows.length > 0) {
-                    const activeRoom = activeRoomResult.rows[0];
+                    const activeRoom =
+                        activeRoomResult.rows[0];
 
                     const questionOrder =
-                        Number(activeRoom.current_question_index) + 1;
+                        Number(
+                            activeRoom.current_question_index
+                        ) + 1;
 
                     const questionResult = await db.query(
                         `SELECT
@@ -477,11 +574,15 @@ io.on("connection", (socket) => {
                          WHERE rq.room_id = $1
                            AND rq.question_order = $2
                          LIMIT 1`,
-                        [room.id, questionOrder]
+                        [
+                            room.id,
+                            questionOrder,
+                        ]
                     );
 
                     if (questionResult.rows.length > 0) {
-                        const question = questionResult.rows[0];
+                        const question =
+                            questionResult.rows[0];
 
                         const optionResult = await db.query(
                             `SELECT
@@ -496,22 +597,35 @@ io.on("connection", (socket) => {
                             [question.room_question_id]
                         );
 
-                        socket.emit("game:question_started", {
-                            question_number: questionOrder,
-                            total_questions: Number(activeRoom.question_count),
-                            question_id: question.question_id,
-                            question_text: question.question_text,
-                            difficulty: question.difficulty,
-                            options: optionResult.rows,
-                            duration: Number(activeRoom.time_per_question),
-                            ends_at: activeQuestionEndsAt.get(room.id) || null,
-                        });
+                        socket.emit(
+                            "game:question_started",
+                            {
+                                question_number: questionOrder,
+                                total_questions: Number(
+                                    activeRoom.question_count
+                                ),
+                                question_id: question.question_id,
+                                question_text: question.question_text,
+                                difficulty: question.difficulty,
+                                options: optionResult.rows,
+                                duration: Number(
+                                    activeRoom.time_per_question
+                                ),
+                                ends_at:
+                                    activeQuestionEndsAt.get(
+                                        room.id
+                                    ) || null,
+                            }
+                        );
                     }
                 }
             }
 
         } catch (error) {
-            console.error("room:join error:", error);
+            console.error(
+                "room:join error:",
+                error
+            );
 
             socket.emit("room:error", {
                 message: "Gagal bergabung ke room",
@@ -536,7 +650,10 @@ io.on("connection", (socket) => {
             }
 
         } catch (error) {
-            console.error("room:sync error:", error);
+            console.error(
+                "room:sync error:",
+                error
+            );
         }
     });
 
@@ -558,7 +675,11 @@ io.on("connection", (socket) => {
                  WHERE id = $1
                    AND room_id = $2
                    AND socket_id = $3`,
-                [playerId, roomId, socket.id]
+                [
+                    playerId,
+                    roomId,
+                    socket.id,
+                ]
             );
 
             await socket.leave(`room_${roomId}`);
@@ -573,7 +694,10 @@ io.on("connection", (socket) => {
             socket.data.playerId = null;
 
         } catch (error) {
-            console.error("room:leave error:", error);
+            console.error(
+                "room:leave error:",
+                error
+            );
         }
     });
 
@@ -616,23 +740,32 @@ io.on("connection", (socket) => {
             const room = roomResult.rows[0];
 
             if (room.status !== "waiting") {
-                throw new Error("Kuis sudah dimulai atau selesai");
+                throw new Error(
+                    "Kuis sudah dimulai atau selesai"
+                );
             }
 
             const playerResult = await client.query(
-                `SELECT id, is_host
+                `SELECT
+                    id,
+                    is_host
                  FROM room_players
                  WHERE id = $1
                    AND room_id = $2
                  LIMIT 1`,
-                [playerId, roomId]
+                [
+                    playerId,
+                    roomId,
+                ]
             );
 
             if (
                 playerResult.rows.length === 0 ||
                 playerResult.rows[0].is_host !== true
             ) {
-                throw new Error("Hanya host yang dapat memulai kuis");
+                throw new Error(
+                    "Hanya host yang dapat memulai kuis"
+                );
             }
 
             const playerCountResult = await client.query(
@@ -643,12 +776,18 @@ io.on("connection", (socket) => {
                 [roomId]
             );
 
-            if (Number(playerCountResult.rows[0].total) < 1) {
-                throw new Error("Belum ada pemain di room");
+            if (
+                Number(playerCountResult.rows[0].total) < 1
+            ) {
+                throw new Error(
+                    "Belum ada pemain di room"
+                );
             }
 
-            const questionCount = Number(room.question_count);
+            const questionCount =
+                Number(room.question_count);
 
+            // Pilih soal secara acak.
             const questionResult = await client.query(
                 `SELECT id
                  FROM questions
@@ -660,19 +799,33 @@ io.on("connection", (socket) => {
             const questions = questionResult.rows;
 
             if (questions.length < questionCount) {
-                throw new Error("Jumlah soal di database tidak mencukupi");
+                throw new Error(
+                    "Jumlah soal di database tidak mencukupi"
+                );
             }
 
+            // Siapkan soal dan pilihan untuk room.
+            // Tidak ada DELETE FROM room_questions di sini.
             for (let i = 0; i < questions.length; i++) {
-                const roomQuestionResult = await client.query(
-                    `INSERT INTO room_questions
-                     (room_id, question_id, question_order)
-                     VALUES ($1, $2, $3)
-                     RETURNING id`,
-                    [roomId, questions[i].id, i + 1]
-                );
+                const roomQuestionResult =
+                    await client.query(
+                        `INSERT INTO room_questions
+                         (
+                            room_id,
+                            question_id,
+                            question_order
+                         )
+                         VALUES ($1, $2, $3)
+                         RETURNING id`,
+                        [
+                            roomId,
+                            questions[i].id,
+                            i + 1,
+                        ]
+                    );
 
-                const roomQuestionId = roomQuestionResult.rows[0].id;
+                const roomQuestionId =
+                    roomQuestionResult.rows[0].id;
 
                 const optionResult = await client.query(
                     `SELECT id
@@ -687,9 +840,17 @@ io.on("connection", (socket) => {
                 for (let j = 0; j < options.length; j++) {
                     await client.query(
                         `INSERT INTO room_question_options
-                         (room_question_id, option_id, display_order)
+                         (
+                            room_question_id,
+                            option_id,
+                            display_order
+                         )
                          VALUES ($1, $2, $3)`,
-                        [roomQuestionId, options[j].id, j + 1]
+                        [
+                            roomQuestionId,
+                            options[j].id,
+                            j + 1,
+                        ]
                     );
                 }
             }
@@ -706,15 +867,23 @@ io.on("connection", (socket) => {
             await client.query("COMMIT");
             transactionStarted = false;
 
-            io.to(`room_${roomId}`).emit("game:started", {
-                success: true,
-                message: "Kuis dimulai!",
-                total_questions: questionCount,
-                time_per_question: Number(room.time_per_question),
-            });
+            io.to(`room_${roomId}`).emit(
+                "game:started",
+                {
+                    success: true,
+                    message: "Kuis dimulai!",
+                    total_questions: questionCount,
+                    time_per_question: Number(
+                        room.time_per_question
+                    ),
+                }
+            );
 
-            console.log(`Room ${roomId}: game dimulai`);
+            console.log(
+                `Room ${roomId}: game dimulai`
+            );
 
+            // Publikasikan soal pertama.
             await publishCurrentQuestion(roomId);
 
         } catch (error) {
@@ -723,10 +892,15 @@ io.on("connection", (socket) => {
                 transactionStarted = false;
             }
 
-            console.error("game:start error:", error);
+            console.error(
+                "game:start error:",
+                error
+            );
 
             socket.emit("room:error", {
-                message: error.message || "Gagal memulai kuis",
+                message:
+                    error.message ||
+                    "Gagal memulai kuis",
             });
 
         } finally {
@@ -735,6 +909,9 @@ io.on("connection", (socket) => {
             }
         }
     });
+
+    // BAGIAN 2 DIMULAI DI SINI:
+    // GAME SUBMIT ANSWER
 
     // ======================================
     // GAME SUBMIT ANSWER
@@ -770,6 +947,8 @@ io.on("connection", (socket) => {
             await client.query("BEGIN");
             transactionStarted = true;
 
+            // Kunci data room agar proses jawaban
+            // tidak bertabrakan dengan perpindahan soal.
             const roomResult = await client.query(
                 `SELECT
                     id,
@@ -797,6 +976,7 @@ io.on("connection", (socket) => {
 
             const endsAt = activeQuestionEndsAt.get(roomId);
 
+            // Validasi waktu berdasarkan jam server.
             if (!endsAt || Date.now() >= endsAt) {
                 throw new Error("Waktu menjawab sudah habis");
             }
@@ -835,9 +1015,12 @@ io.on("connection", (socket) => {
             );
 
             if (optionResult.rows.length === 0) {
-                throw new Error("Pilihan tidak sesuai dengan soal aktif");
+                throw new Error(
+                    "Pilihan tidak sesuai dengan soal aktif"
+                );
             }
 
+            // Pastikan pemain belum menjawab soal ini.
             const existingAnswerResult = await client.query(
                 `SELECT id
                  FROM game_answers
@@ -845,17 +1028,27 @@ io.on("connection", (socket) => {
                    AND player_id = $2
                    AND question_id = $3
                  LIMIT 1`,
-                [roomId, playerId, question.question_id]
+                [
+                    roomId,
+                    playerId,
+                    question.question_id,
+                ]
             );
 
             if (existingAnswerResult.rows.length > 0) {
                 throw new Error("Kamu sudah menjawab soal ini");
             }
 
-            const isCorrect = optionResult.rows[0].is_correct === true;
+            const isCorrect =
+                optionResult.rows[0].is_correct === true;
 
-            const durationMs = Number(room.time_per_question) * 1000;
-            const remainingMs = Math.max(0, endsAt - Date.now());
+            const durationMs =
+                Number(room.time_per_question) * 1000;
+
+            const remainingMs = Math.max(
+                0,
+                endsAt - Date.now()
+            );
 
             const answerTimeMs = Math.min(
                 durationMs,
@@ -863,10 +1056,14 @@ io.on("connection", (socket) => {
             );
 
             const speedBonus = isCorrect
-                ? Math.floor((remainingMs / durationMs) * 500)
+                ? Math.floor(
+                    (remainingMs / durationMs) * 500
+                )
                 : 0;
 
-            const points = isCorrect ? 1000 + speedBonus : 0;
+            const points = isCorrect
+                ? 1000 + speedBonus
+                : 0;
 
             await client.query(
                 `INSERT INTO game_answers
@@ -897,12 +1094,18 @@ io.on("connection", (socket) => {
                  SET score = score + $1
                  WHERE id = $2
                    AND room_id = $3`,
-                [points, playerId, roomId]
+                [
+                    points,
+                    playerId,
+                    roomId,
+                ]
             );
 
             await client.query("COMMIT");
             transactionStarted = false;
 
+            // Jawaban hanya dikunci untuk pemain ini.
+            // Timer room TIDAK dihentikan.
             socket.emit("game:answer_result", {
                 success: true,
                 is_correct: isCorrect,
@@ -911,8 +1114,10 @@ io.on("connection", (socket) => {
                 message: isCorrect
                     ? "Jawaban benar!"
                     : "Jawaban belum tepat",
+                ends_at: endsAt,
             });
 
+            // Perbarui leaderboard semua pemain.
             const leaderboardResult = await db.query(
                 `SELECT
                     id AS player_id,
@@ -925,10 +1130,13 @@ io.on("connection", (socket) => {
                 [roomId]
             );
 
-            io.to(`room_${roomId}`).emit("game:leaderboard", {
-                question_number: questionOrder,
-                players: leaderboardResult.rows,
-            });
+            io.to(`room_${roomId}`).emit(
+                "game:leaderboard",
+                {
+                    question_number: questionOrder,
+                    players: leaderboardResult.rows,
+                }
+            );
 
             console.log(
                 `Pemain ${playerId} menjawab soal ${questionOrder}: ${points} poin`
@@ -940,11 +1148,16 @@ io.on("connection", (socket) => {
                 transactionStarted = false;
             }
 
-            console.error("game:submit_answer error:", error);
+            console.error(
+                "game:submit_answer error:",
+                error
+            );
 
             socket.emit("game:answer_result", {
                 success: false,
-                message: error.message || "Gagal menyimpan jawaban",
+                message:
+                    error.message ||
+                    "Gagal menyimpan jawaban",
             });
 
         } finally {
@@ -974,12 +1187,19 @@ io.on("connection", (socket) => {
                  WHERE id = $1
                    AND room_id = $2
                    AND socket_id = $3`,
-                [playerId, roomId, socket.id]
+                [
+                    playerId,
+                    roomId,
+                    socket.id,
+                ]
             );
 
-            io.to(`room_${roomId}`).emit("room:player_left", {
-                player_id: playerId,
-            });
+            io.to(`room_${roomId}`).emit(
+                "room:player_left",
+                {
+                    player_id: playerId,
+                }
+            );
 
             await publishRoomState(roomId);
 
@@ -1006,7 +1226,7 @@ async function startServer() {
 
         httpServer.listen(PORT, HOST, () => {
             console.log("----------------------------------");
-            console.log("INFORMATICS QUIZ ARENA BACKEND");
+            console.log("IF QUIZZ BACKEND");
             console.log(`Server berjalan pada ${HOST}:${PORT}`);
             console.log(`Port: ${PORT}`);
             console.log("Health Check: /health");
@@ -1014,11 +1234,16 @@ async function startServer() {
             console.log("Game Start: Aktif");
             console.log("Game Answer: Aktif");
             console.log("Leaderboard: Aktif");
+            console.log("Shared Server Timer: Aktif");
+            console.log("Question Preloading: Aktif");
             console.log("----------------------------------");
         });
 
     } catch (error) {
-        console.error("Gagal menjalankan server:", error);
+        console.error(
+            "Gagal menjalankan server:",
+            error
+        );
         process.exit(1);
     }
 }
