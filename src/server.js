@@ -232,6 +232,7 @@ async function getPowerupUsageStatus(
 
     return result;
 }
+
 // ==========================================
 // HELPER: PUBLISH ROOM STATE
 // ==========================================
@@ -260,6 +261,165 @@ function clearRoomTimer(roomId) {
     }
 
     activeQuestionEndsAt.delete(roomId);
+}
+
+// ==========================================
+// HELPER: GET PLAYER ACHIEVEMENTS
+// ==========================================
+
+async function getPlayerAchievements(guestId) {
+    if (!guestId) {
+        return [];
+    }
+
+    const result = await db.query(
+        `SELECT
+            achievement_code,
+            unlocked_at
+         FROM player_achievements
+         WHERE guest_id = $1
+         ORDER BY unlocked_at ASC`,
+        [guestId]
+    );
+
+    return result.rows;
+}
+
+// ==========================================
+// HELPER: EVALUATE ACHIEVEMENTS
+// ==========================================
+
+async function evaluatePlayerAchievements({
+    roomId,
+    playerId,
+    guestId,
+    leaderboard,
+    questionCount,
+}) {
+    if (!guestId) {
+        return [];
+    }
+
+    const achievements = [];
+
+    const playerRank = leaderboard.findIndex(
+        (player) =>
+            Number(player.player_id) === Number(playerId)
+    ) + 1;
+
+    // Statistik jawaban dalam pertandingan.
+    const answerStatsResult = await db.query(
+        `SELECT
+            COUNT(*)::INTEGER AS total_answers,
+
+            COUNT(*) FILTER (
+                WHERE is_correct = TRUE
+            )::INTEGER AS correct_answers,
+
+            COUNT(*) FILTER (
+                WHERE is_correct = TRUE
+                  AND answer_time_ms <= 5000
+            )::INTEGER AS fast_correct_answers
+
+         FROM game_answers
+         WHERE room_id = $1
+           AND player_id = $2`,
+        [roomId, playerId]
+    );
+
+    const answerStats = answerStatsResult.rows[0];
+
+    // Combo terbaik dalam pertandingan.
+    const comboResult = await db.query(
+        `SELECT
+            COALESCE(best_combo, 0)::INTEGER AS best_combo
+         FROM player_match_stats
+         WHERE room_id = $1
+           AND player_id = $2
+         LIMIT 1`,
+        [roomId, playerId]
+    );
+
+    const bestCombo = comboResult.rows.length > 0
+        ? Number(comboResult.rows[0].best_combo)
+        : 0;
+
+    // Jumlah kemenangan sepanjang riwayat Guest ID.
+    // Pemain dengan skor tertinggi bersama-sama
+    // tetap dihitung sebagai pemenang.
+    const careerWinsResult = await db.query(
+        `SELECT
+            COUNT(*)::INTEGER AS total_wins
+         FROM room_players rp
+         INNER JOIN game_rooms gr
+            ON gr.id = rp.room_id
+         WHERE rp.guest_id = $1
+           AND gr.status = 'finished'
+           AND rp.score = (
+               SELECT MAX(rp2.score)
+               FROM room_players rp2
+               WHERE rp2.room_id = rp.room_id
+           )`,
+        [guestId]
+    );
+
+    const careerWins = Number(
+        careerWinsResult.rows[0].total_wins
+    );
+
+    // 1. First Victory.
+    if (playerRank === 1) {
+        achievements.push("first_victory");
+    }
+
+    // 2. Perfect Player.
+    if (
+        Number(answerStats.total_answers) ===
+            Number(questionCount) &&
+        Number(answerStats.correct_answers) ===
+            Number(questionCount)
+    ) {
+        achievements.push("perfect_player");
+    }
+
+    // 3. Speed Demon.
+    if (
+        Number(answerStats.fast_correct_answers) >= 10
+    ) {
+        achievements.push("speed_demon");
+    }
+
+    // 4. Unstoppable.
+    if (bestCombo >= 10) {
+        achievements.push("unstoppable");
+    }
+
+    // 5. Quiz Champion.
+    if (careerWins >= 50) {
+        achievements.push("quiz_champion");
+    }
+
+    const newlyUnlocked = [];
+
+    for (const achievementCode of achievements) {
+        const insertResult = await db.query(
+            `INSERT INTO player_achievements (
+                guest_id,
+                achievement_code
+             )
+             VALUES ($1, $2)
+             ON CONFLICT (guest_id, achievement_code)
+             DO NOTHING
+             RETURNING achievement_code, unlocked_at`,
+            [guestId, achievementCode]
+        );
+
+        if (insertResult.rows.length > 0) {
+            newlyUnlocked.push(insertResult.rows[0]);
+        }
+    }
+
+    return newlyUnlocked;
 }
 
 // ==========================================
@@ -336,7 +496,6 @@ async function publishCurrentQuestion(roomId) {
 
         activeQuestionEndsAt.set(roomId, endsAt);
 
-        // Tidak mengirim kunci jawaban atau pembahasan.
         io.to(`room_${roomId}`).emit(
             "game:question_started",
             {
@@ -480,7 +639,91 @@ async function finishGame(roomId) {
             [roomId]
         );
 
-        // Ambil socket pemain di room.
+        const roomResult = await db.query(
+            `SELECT question_count
+             FROM game_rooms
+             WHERE id = $1
+             LIMIT 1`,
+            [roomId]
+        );
+
+        const questionCount = Number(
+            roomResult.rows[0]?.question_count || 0
+        );
+
+        // Ambil Guest ID seluruh pemain.
+        // Jika kolom belum tersedia, hasil pertandingan
+        // tetap dapat dikirim tanpa Achievement.
+        let roomPlayers = [];
+
+        try {
+            const playersResult = await db.query(
+                `SELECT
+                    id AS player_id,
+                    guest_id
+                 FROM room_players
+                 WHERE room_id = $1`,
+                [roomId]
+            );
+
+            roomPlayers = playersResult.rows;
+
+        } catch (achievementError) {
+            console.error(
+                "Gagal mengambil Guest ID pemain:",
+                achievementError
+            );
+        }
+
+        // Simpan Achievement untuk seluruh pemain,
+        // termasuk pemain yang sedang offline.
+        const achievementByPlayer = new Map();
+
+        for (const player of roomPlayers) {
+            const playerId = Number(player.player_id);
+            const guestId = player.guest_id;
+
+            if (!guestId) {
+                achievementByPlayer.set(playerId, {
+                    newlyUnlocked: [],
+                    achievements: [],
+                });
+
+                continue;
+            }
+
+            try {
+                const newlyUnlocked =
+                    await evaluatePlayerAchievements({
+                        roomId,
+                        playerId,
+                        guestId,
+                        leaderboard: leaderboardResult.rows,
+                        questionCount,
+                    });
+
+                const achievements =
+                    await getPlayerAchievements(guestId);
+
+                achievementByPlayer.set(playerId, {
+                    newlyUnlocked,
+                    achievements,
+                });
+
+            } catch (achievementError) {
+                console.error(
+                    `Achievement gagal dievaluasi untuk player ${playerId}:`,
+                    achievementError
+                );
+
+                achievementByPlayer.set(playerId, {
+                    newlyUnlocked: [],
+                    achievements: [],
+                });
+            }
+        }
+
+        // Ambil semua socket yang masih berada di room.
         const sockets = await io
             .in(`room_${roomId}`)
             .fetchSockets();
@@ -497,7 +740,7 @@ async function finishGame(roomId) {
                 continue;
             }
 
-            // Hanya mengambil jawaban salah milik pemain ini.
+            // Ambil review jawaban salah pemain.
             const reviewResult = await db.query(
                 `SELECT
                     rq.question_order,
@@ -529,16 +772,31 @@ async function finishGame(roomId) {
                 ]
             );
 
+            const achievementData =
+                achievementByPlayer.get(playerId) || {
+                    newlyUnlocked: [],
+                    achievements: [],
+                };
+
             playerSocket.emit("game:finished", {
                 success: true,
                 message: "Kuis telah selesai!",
                 leaderboard: leaderboardResult.rows,
                 answer_reviews: reviewResult.rows,
+
+                // Achievement yang baru terbuka.
+                newly_unlocked_achievements:
+                    achievementData.newlyUnlocked,
+
+                // Seluruh koleksi Achievement pemain.
+                achievements:
+                    achievementData.achievements,
             });
 
             console.log(
                 `Room ${roomId}: hasil dikirim ke player ${playerId}. ` +
-                `Jumlah jawaban salah: ${reviewResult.rows.length}`
+                `Jawaban salah: ${reviewResult.rows.length}. ` +
+                `Achievement baru: ${achievementData.newlyUnlocked.length}`
             );
         }
 
@@ -614,7 +872,8 @@ io.on("connection", (socket) => {
                 `SELECT
                     id,
                     nickname,
-                    is_host
+                    is_host,
+                    guest_id
                  FROM room_players
                  WHERE id = $1
                    AND room_id = $2
@@ -664,22 +923,25 @@ io.on("connection", (socket) => {
                     is_host: player.is_host,
                 },
             });
+
             // Kirim status kuota dan cooldown Power-Up saat reconnect.
             if (
                 state.room.status === "playing" &&
                 state.room.enable_powerup
             ) {
-                const powerupUsage = await getPowerupUsageStatus(
-                    room.id,
-                    playerId,
-                    state.room.question_count
-                );
+                const powerupUsage =
+                    await getPowerupUsageStatus(
+                        room.id,
+                        playerId,
+                        state.room.question_count
+                    );
 
                 socket.emit("powerup:status", {
                     success: true,
                     powerups: powerupUsage,
                 });
             }
+
             await publishRoomState(room.id);
 
             // ======================================
@@ -730,11 +992,32 @@ io.on("connection", (socket) => {
                     ]
                 );
 
+                // Ambil koleksi Achievement milik pemain.
+                let achievements = [];
+
+                try {
+                    achievements =
+                        await getPlayerAchievements(
+                            player.guest_id
+                        );
+                } catch (achievementError) {
+                    console.error(
+                        "Gagal mengambil Achievement saat reconnect:",
+                        achievementError
+                    );
+                }
+
                 socket.emit("game:finished", {
                     success: true,
                     message: "Kuis telah selesai!",
                     leaderboard: leaderboardResult.rows,
                     answer_reviews: reviewResult.rows,
+
+                    // Tidak membuka ulang Achievement.
+                    newly_unlocked_achievements: [],
+
+                    // Koleksi Achievement tetap dikirim.
+                    achievements,
                 });
 
                 console.log(
@@ -1147,402 +1430,418 @@ io.on("connection", (socket) => {
     // POWER-UP USE
     // ======================================
 
-    
-socket.on("powerup:use", async (data) => {
-    let client;
-    let transactionStarted = false;
+    socket.on("powerup:use", async (data) => {
+        let client;
+        let transactionStarted = false;
 
-    const powerupType = String(data?.type || "");
+        const powerupType = String(data?.type || "");
 
-    try {
-        const roomId = socket.data.roomId;
-        const playerId = socket.data.playerId;
+        try {
+            const roomId = socket.data.roomId;
+            const playerId = socket.data.playerId;
 
-        if (!roomId || !playerId) {
-            throw new Error("Kamu belum bergabung ke room");
-        }
-
-        if (
-            !["fifty_fifty", "double_points"].includes(powerupType)
-        ) {
-            throw new Error("Jenis Power-Up tidak valid");
-        }
-
-        client = await db.connect();
-
-        await client.query("BEGIN");
-        transactionStarted = true;
-
-        const roomResult = await client.query(
-            `SELECT
-                id,
-                status,
-                question_count,
-                enable_powerup,
-                current_question_index
-             FROM game_rooms
-             WHERE id = $1
-             FOR UPDATE`,
-            [roomId]
-        );
-
-        if (roomResult.rows.length === 0) {
-            throw new Error("Room tidak ditemukan");
-        }
-
-        const room = roomResult.rows[0];
-
-        if (room.status !== "playing") {
-            throw new Error(
-                "Pertandingan tidak sedang berlangsung"
-            );
-        }
-
-        if (!room.enable_powerup) {
-            throw new Error(
-                "Power-Up tidak diaktifkan di room ini"
-            );
-        }
-
-        const endsAt = activeQuestionEndsAt.get(roomId);
-
-        if (!endsAt || Date.now() >= endsAt) {
-            throw new Error("Waktu soal sudah habis");
-        }
-
-        const questionOrder =
-            Number(room.current_question_index) + 1;
-
-        const questionResult = await client.query(
-            `SELECT
-                rq.question_id,
-                rq.id AS room_question_id
-             FROM room_questions rq
-             WHERE rq.room_id = $1
-               AND rq.question_order = $2
-             LIMIT 1`,
-            [roomId, questionOrder]
-        );
-
-        if (questionResult.rows.length === 0) {
-            throw new Error("Soal aktif tidak ditemukan");
-        }
-
-        const question = questionResult.rows[0];
-
-        // Pemain tidak boleh memakai skill setelah menjawab.
-        const answerResult = await client.query(
-            `SELECT id
-             FROM game_answers
-             WHERE room_id = $1
-               AND player_id = $2
-               AND question_id = $3
-             LIMIT 1`,
-            [
-                roomId,
-                playerId,
-                question.question_id,
-            ]
-        );
-
-        if (answerResult.rows.length > 0) {
-            throw new Error(
-                "Power-Up tidak bisa digunakan setelah menjawab"
-            );
-        }
-
-        // ======================================
-        // VALIDASI DOUBLE POINTS
-        // ======================================
-
-        await client.query(
-            `INSERT INTO player_match_stats
-            (
-                room_id,
-                player_id,
-                current_combo,
-                best_combo,
-                double_points_pending
-            )
-            VALUES ($1, $2, 0, 0, FALSE)
-            ON CONFLICT (room_id, player_id)
-            DO NOTHING`,
-            [roomId, playerId]
-        );
-
-        const statsResult = await client.query(
-            `SELECT double_points_pending
-             FROM player_match_stats
-             WHERE room_id = $1
-               AND player_id = $2
-             FOR UPDATE`,
-            [roomId, playerId]
-        );
-
-        const stats = statsResult.rows[0];
-
-        if (
-            powerupType === "double_points" &&
-            stats.double_points_pending === true
-        ) {
-            throw new Error(
-                "Double Points masih aktif untuk jawaban berikutnya"
-            );
-        }
-
-        // ======================================
-        // HITUNG KUOTA SKILL
-        // ======================================
-
-        const maxUses = Math.floor(
-            Number(room.question_count) / 10
-        );
-
-        const usageResult = await client.query(
-            `SELECT
-                COUNT(*)::INTEGER AS total_uses,
-                MAX(used_at) AS last_used_at
-             FROM player_powerup_uses
-             WHERE room_id = $1
-               AND player_id = $2
-               AND powerup_type = $3`,
-            [
-                roomId,
-                playerId,
-                powerupType,
-            ]
-        );
-
-        const usage = usageResult.rows[0];
-
-        const totalUses = Number(usage.total_uses);
-        const remainingUses = Math.max(
-            0,
-            maxUses - totalUses
-        );
-
-        if (remainingUses <= 0) {
-            throw new Error(
-                `Kuota ${powerupType} sudah habis (${maxUses} kali)`
-            );
-        }
-
-        // ======================================
-        // VALIDASI COOLDOWN 30 DETIK
-        // ======================================
-
-        if (usage.last_used_at) {
-            const lastUsedAt = new Date(
-                usage.last_used_at
-            ).getTime();
-
-            const cooldownEnd =
-                lastUsedAt +
-                POWERUP_COOLDOWN_SECONDS * 1000;
-
-            const cooldownRemaining = Math.max(
-                0,
-                Math.ceil(
-                    (cooldownEnd - Date.now()) / 1000
-                )
-            );
-
-            if (cooldownRemaining > 0) {
+            if (!roomId || !playerId) {
                 throw new Error(
-                    `Skill sedang cooldown. Tunggu ${cooldownRemaining} detik lagi.`
+                    "Kamu belum bergabung ke room"
                 );
             }
-        }
-
-        // ======================================
-        // VALIDASI DAN SIAPKAN SKILL 50:50
-        // ======================================
-
-        let remainingOptions = null;
-
-        if (powerupType === "fifty_fifty") {
-            const correctResult = await client.query(
-                `SELECT
-                    qo.id AS option_id,
-                    qo.option_text,
-                    rqo.display_order
-                 FROM room_question_options rqo
-                 INNER JOIN question_options qo
-                    ON qo.id = rqo.option_id
-                 WHERE rqo.room_question_id = $1
-                   AND qo.is_correct = TRUE
-                 LIMIT 1`,
-                [question.room_question_id]
-            );
-
-            const wrongResult = await client.query(
-                `SELECT
-                    qo.id AS option_id,
-                    qo.option_text,
-                    rqo.display_order
-                 FROM room_question_options rqo
-                 INNER JOIN question_options qo
-                    ON qo.id = rqo.option_id
-                 WHERE rqo.room_question_id = $1
-                   AND qo.is_correct = FALSE
-                 ORDER BY RANDOM()
-                 LIMIT 1`,
-                [question.room_question_id]
-            );
 
             if (
-                correctResult.rows.length === 0 ||
-                wrongResult.rows.length === 0
+                !["fifty_fifty", "double_points"].includes(
+                    powerupType
+                )
             ) {
                 throw new Error(
-                    "Pilihan jawaban tidak mencukupi untuk 50:50"
+                    "Jenis Power-Up tidak valid"
                 );
             }
 
-            remainingOptions = [
-                ...correctResult.rows,
-                ...wrongResult.rows,
-            ].sort(
-                (a, b) =>
-                    Number(a.display_order) -
-                    Number(b.display_order)
+            client = await db.connect();
+
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            const roomResult = await client.query(
+                `SELECT
+                    id,
+                    status,
+                    question_count,
+                    enable_powerup,
+                    current_question_index
+                 FROM game_rooms
+                 WHERE id = $1
+                 FOR UPDATE`,
+                [roomId]
             );
-        }
 
-        // ======================================
-        // SIMPAN PENGGUNAAN SKILL
-        // ======================================
+            if (roomResult.rows.length === 0) {
+                throw new Error("Room tidak ditemukan");
+            }
 
-        await client.query(
-            `INSERT INTO player_powerup_uses
-            (
-                room_id,
-                player_id,
-                powerup_type,
-                question_id,
-                used_at
-            )
-            VALUES ($1, $2, $3, $4, NOW())`,
-            [
-                roomId,
-                playerId,
-                powerupType,
-                question.question_id,
-            ]
-        );
+            const room = roomResult.rows[0];
 
-        // ======================================
-        // DOUBLE POINTS
-        // ======================================
+            if (room.status !== "playing") {
+                throw new Error(
+                    "Pertandingan tidak sedang berlangsung"
+                );
+            }
 
-        if (powerupType === "double_points") {
-            await client.query(
-                `UPDATE player_match_stats
-                 SET double_points_pending = TRUE,
-                     updated_at = NOW()
+            if (!room.enable_powerup) {
+                throw new Error(
+                    "Power-Up tidak diaktifkan di room ini"
+                );
+            }
+
+            const endsAt = activeQuestionEndsAt.get(roomId);
+
+            if (!endsAt || Date.now() >= endsAt) {
+                throw new Error(
+                    "Waktu soal sudah habis"
+                );
+            }
+
+            const questionOrder =
+                Number(room.current_question_index) + 1;
+
+            const questionResult = await client.query(
+                `SELECT
+                    rq.question_id,
+                    rq.id AS room_question_id
+                 FROM room_questions rq
+                 WHERE rq.room_id = $1
+                   AND rq.question_order = $2
+                 LIMIT 1`,
+                [roomId, questionOrder]
+            );
+
+            if (questionResult.rows.length === 0) {
+                throw new Error(
+                    "Soal aktif tidak ditemukan"
+                );
+            }
+
+            const question = questionResult.rows[0];
+
+            // Pemain tidak boleh memakai skill setelah menjawab.
+            const answerResult = await client.query(
+                `SELECT id
+                 FROM game_answers
                  WHERE room_id = $1
-                   AND player_id = $2`,
+                   AND player_id = $2
+                   AND question_id = $3
+                 LIMIT 1`,
+                [
+                    roomId,
+                    playerId,
+                    question.question_id,
+                ]
+            );
+
+            if (answerResult.rows.length > 0) {
+                throw new Error(
+                    "Power-Up tidak bisa digunakan setelah menjawab"
+                );
+            }
+
+            // ======================================
+            // VALIDASI DOUBLE POINTS
+            // ======================================
+
+            await client.query(
+                `INSERT INTO player_match_stats
+                (
+                    room_id,
+                    player_id,
+                    current_combo,
+                    best_combo,
+                    double_points_pending
+                )
+                VALUES ($1, $2, 0, 0, FALSE)
+                ON CONFLICT (room_id, player_id)
+                DO NOTHING`,
                 [roomId, playerId]
             );
-        }
 
-        await client.query("COMMIT");
-        transactionStarted = false;
+            const statsResult = await client.query(
+                `SELECT double_points_pending
+                 FROM player_match_stats
+                 WHERE room_id = $1
+                   AND player_id = $2
+                 FOR UPDATE`,
+                [roomId, playerId]
+            );
 
-        // ======================================
-        // STATUS PENGGUNAAN TERBARU
-        // ======================================
+            const stats = statsResult.rows[0];
 
-        const updatedUsageResult = await db.query(
-            `SELECT
-                COUNT(*)::INTEGER AS total_uses,
-                MAX(used_at) AS last_used_at
-             FROM player_powerup_uses
-             WHERE room_id = $1
-               AND player_id = $2
-               AND powerup_type = $3`,
-            [
-                roomId,
-                playerId,
-                powerupType,
-            ]
-        );
+            if (
+                powerupType === "double_points" &&
+                stats.double_points_pending === true
+            ) {
+                throw new Error(
+                    "Double Points masih aktif untuk jawaban berikutnya"
+                );
+            }
 
-        const updatedUsage = updatedUsageResult.rows[0];
+            // ======================================
+            // HITUNG KUOTA SKILL
+            // ======================================
 
-        const newTotalUses = Number(
-            updatedUsage.total_uses
-        );
+            const maxUses = Math.floor(
+                Number(room.question_count) / 10
+            );
 
-        const newRemainingUses = Math.max(
-            0,
-            maxUses - newTotalUses
-        );
+            const usageResult = await client.query(
+                `SELECT
+                    COUNT(*)::INTEGER AS total_uses,
+                    MAX(used_at) AS last_used_at
+                 FROM player_powerup_uses
+                 WHERE room_id = $1
+                   AND player_id = $2
+                   AND powerup_type = $3`,
+                [
+                    roomId,
+                    playerId,
+                    powerupType,
+                ]
+            );
 
-        const cooldownUntil = new Date(
-            new Date(updatedUsage.last_used_at).getTime() +
-            POWERUP_COOLDOWN_SECONDS * 1000
-        ).toISOString();
+            const usage = usageResult.rows[0];
 
-        const response = {
-            success: true,
-            type: powerupType,
-            message:
-                powerupType === "fifty_fifty"
-                    ? "Power-Up 50:50 berhasil digunakan!"
-                    : "Double Points berhasil diaktifkan!",
-            total_uses: newTotalUses,
-            max_uses: maxUses,
-            remaining_uses: newRemainingUses,
-            cooldown_seconds: POWERUP_COOLDOWN_SECONDS,
-            cooldown_remaining: POWERUP_COOLDOWN_SECONDS,
-            cooldown_until: cooldownUntil,
-        };
+            const totalUses = Number(usage.total_uses);
+            const remainingUses = Math.max(
+                0,
+                maxUses - totalUses
+            );
 
-        if (powerupType === "fifty_fifty") {
-            response.options = remainingOptions;
-        }
+            if (remainingUses <= 0) {
+                throw new Error(
+                    `Kuota ${powerupType} sudah habis (${maxUses} kali)`
+                );
+            }
 
-        socket.emit("powerup:result", response);
-        const powerupUsage = await getPowerupUsageStatus(
-            roomId,
-            playerId,
-            room.question_count
-        );
+            // ======================================
+            // VALIDASI COOLDOWN 30 DETIK
+            // ======================================
 
-        socket.emit("powerup:status", {
-            success: true,
-            powerups: powerupUsage,
-        });
-        console.log(
-            `Player ${playerId} menggunakan ${powerupType}. ` +
-            `Penggunaan: ${newTotalUses}/${maxUses}. ` +
-            `Cooldown: 30 detik.`
-        );
+            if (usage.last_used_at) {
+                const lastUsedAt = new Date(
+                    usage.last_used_at
+                ).getTime();
 
-    } catch (error) {
-        if (client && transactionStarted) {
-            await client.query("ROLLBACK");
+                const cooldownEnd =
+                    lastUsedAt +
+                    POWERUP_COOLDOWN_SECONDS * 1000;
+
+                const cooldownRemaining = Math.max(
+                    0,
+                    Math.ceil(
+                        (cooldownEnd - Date.now()) / 1000
+                    )
+                );
+
+                if (cooldownRemaining > 0) {
+                    throw new Error(
+                        `Skill sedang cooldown. Tunggu ${cooldownRemaining} detik lagi.`
+                    );
+                }
+            }
+
+            // ======================================
+            // VALIDASI DAN SIAPKAN SKILL 50:50
+            // ======================================
+
+            let remainingOptions = null;
+
+            if (powerupType === "fifty_fifty") {
+                const correctResult = await client.query(
+                    `SELECT
+                        qo.id AS option_id,
+                        qo.option_text,
+                        rqo.display_order
+                     FROM room_question_options rqo
+                     INNER JOIN question_options qo
+                        ON qo.id = rqo.option_id
+                     WHERE rqo.room_question_id = $1
+                       AND qo.is_correct = TRUE
+                     LIMIT 1`,
+                    [question.room_question_id]
+                );
+
+                const wrongResult = await client.query(
+                    `SELECT
+                        qo.id AS option_id,
+                        qo.option_text,
+                        rqo.display_order
+                     FROM room_question_options rqo
+                     INNER JOIN question_options qo
+                        ON qo.id = rqo.option_id
+                     WHERE rqo.room_question_id = $1
+                       AND qo.is_correct = FALSE
+                     ORDER BY RANDOM()
+                     LIMIT 1`,
+                    [question.room_question_id]
+                );
+
+                if (
+                    correctResult.rows.length === 0 ||
+                    wrongResult.rows.length === 0
+                ) {
+                    throw new Error(
+                        "Pilihan jawaban tidak mencukupi untuk 50:50"
+                    );
+                }
+
+                remainingOptions = [
+                    ...correctResult.rows,
+                    ...wrongResult.rows,
+                ].sort(
+                    (a, b) =>
+                        Number(a.display_order) -
+                        Number(b.display_order)
+                );
+            }
+
+            // ======================================
+            // SIMPAN PENGGUNAAN SKILL
+            // ======================================
+
+            await client.query(
+                `INSERT INTO player_powerup_uses
+                (
+                    room_id,
+                    player_id,
+                    powerup_type,
+                    question_id,
+                    used_at
+                )
+                VALUES ($1, $2, $3, $4, NOW())`,
+                [
+                    roomId,
+                    playerId,
+                    powerupType,
+                    question.question_id,
+                ]
+            );
+
+            // ======================================
+            // DOUBLE POINTS
+            // ======================================
+
+            if (powerupType === "double_points") {
+                await client.query(
+                    `UPDATE player_match_stats
+                     SET double_points_pending = TRUE,
+                         updated_at = NOW()
+                     WHERE room_id = $1
+                       AND player_id = $2`,
+                    [roomId, playerId]
+                );
+            }
+
+            await client.query("COMMIT");
             transactionStarted = false;
+
+            // ======================================
+            // STATUS PENGGUNAAN TERBARU
+            // ======================================
+
+            const updatedUsageResult = await db.query(
+                `SELECT
+                    COUNT(*)::INTEGER AS total_uses,
+                    MAX(used_at) AS last_used_at
+                 FROM player_powerup_uses
+                 WHERE room_id = $1
+                   AND player_id = $2
+                   AND powerup_type = $3`,
+                [
+                    roomId,
+                    playerId,
+                    powerupType,
+                ]
+            );
+
+            const updatedUsage = updatedUsageResult.rows[0];
+
+            const newTotalUses = Number(
+                updatedUsage.total_uses
+            );
+
+            const newRemainingUses = Math.max(
+                0,
+                maxUses - newTotalUses
+            );
+
+            const cooldownUntil = new Date(
+                new Date(
+                    updatedUsage.last_used_at
+                ).getTime() +
+                POWERUP_COOLDOWN_SECONDS * 1000
+            ).toISOString();
+
+            const response = {
+                success: true,
+                type: powerupType,
+                message:
+                    powerupType === "fifty_fifty"
+                        ? "Power-Up 50:50 berhasil digunakan!"
+                        : "Double Points berhasil diaktifkan!",
+                total_uses: newTotalUses,
+                max_uses: maxUses,
+                remaining_uses: newRemainingUses,
+                cooldown_seconds: POWERUP_COOLDOWN_SECONDS,
+                cooldown_remaining: POWERUP_COOLDOWN_SECONDS,
+                cooldown_until: cooldownUntil,
+            };
+
+            if (powerupType === "fifty_fifty") {
+                response.options = remainingOptions;
+            }
+
+            socket.emit("powerup:result", response);
+
+            const powerupUsage =
+                await getPowerupUsageStatus(
+                    roomId,
+                    playerId,
+                    room.question_count
+                );
+
+            socket.emit("powerup:status", {
+                success: true,
+                powerups: powerupUsage,
+            });
+
+            console.log(
+                `Player ${playerId} menggunakan ${powerupType}. ` +
+                `Penggunaan: ${newTotalUses}/${maxUses}. ` +
+                `Cooldown: 30 detik.`
+            );
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+            }
+
+            console.error(
+                "powerup:use error:",
+                error
+            );
+
+            socket.emit("powerup:result", {
+                success: false,
+                type: powerupType,
+                message:
+                    error.message ||
+                    "Gagal menggunakan Power-Up",
+            });
+
+        } finally {
+            if (client) {
+                client.release();
+            }
         }
-
-        console.error("powerup:use error:", error);
-
-        socket.emit("powerup:result", {
-            success: false,
-            type: powerupType,
-            message:
-                error.message ||
-                "Gagal menggunakan Power-Up",
-        });
-
-    } finally {
-        if (client) {
-            client.release();
-        }
-    }
-});
-
+    });
 
     // ======================================
     // GAME SUBMIT ANSWER
@@ -1597,7 +1896,9 @@ socket.on("powerup:use", async (data) => {
                 roomResult.rows.length === 0 ||
                 roomResult.rows[0].status !== "playing"
             ) {
-                throw new Error("Kuis tidak sedang berlangsung");
+                throw new Error(
+                    "Kuis tidak sedang berlangsung"
+                );
             }
 
             const room = roomResult.rows[0];
@@ -1608,7 +1909,9 @@ socket.on("powerup:use", async (data) => {
             const endsAt = activeQuestionEndsAt.get(roomId);
 
             if (!endsAt || Date.now() >= endsAt) {
-                throw new Error("Waktu menjawab sudah habis");
+                throw new Error(
+                    "Waktu menjawab sudah habis"
+                );
             }
 
             const questionResult = await client.query(
@@ -1626,7 +1929,9 @@ socket.on("powerup:use", async (data) => {
             );
 
             if (questionResult.rows.length === 0) {
-                throw new Error("Soal aktif tidak ditemukan");
+                throw new Error(
+                    "Soal aktif tidak ditemukan"
+                );
             }
 
             const question = questionResult.rows[0];
@@ -1668,7 +1973,9 @@ socket.on("powerup:use", async (data) => {
             );
 
             if (existingAnswerResult.rows.length > 0) {
-                throw new Error("Kamu sudah menjawab soal ini");
+                throw new Error(
+                    "Kamu sudah menjawab soal ini"
+                );
             }
 
             const isCorrect =
@@ -1756,7 +2063,6 @@ socket.on("powerup:use", async (data) => {
                 )
                 : 0;
 
-           
             // ======================================
             // POIN DASAR
             // ======================================
@@ -1766,7 +2072,9 @@ socket.on("powerup:use", async (data) => {
             // Power Battle  : 1000 poin dasar
             // Ultimate      :  800 poin dasar
 
-            const basePoints = room.enable_combo ? 800 : 1000;
+            const basePoints = room.enable_combo
+                ? 800
+                : 1000;
 
             const normalPoints = isCorrect
                 ? basePoints + speedBonus + comboBonus
@@ -1810,10 +2118,9 @@ socket.on("powerup:use", async (data) => {
                     isCorrect,
                     doublePointsActive,
                     roomId,
-                    playerId
+                    playerId,
                 ]
             );
-
 
             // ======================================
             // SIMPAN JAWABAN
@@ -1862,20 +2169,19 @@ socket.on("powerup:use", async (data) => {
             await client.query("COMMIT");
             transactionStarted = false;
 
-            // Respons tetap netral, tanpa membocorkan benar atau salah.
+            // Respons netral, tanpa membocorkan benar atau salah.
             socket.emit("game:answer_result", {
                 success: true,
                 message: "Jawaban berhasil dicatat.",
                 ends_at: endsAt,
 
-                // Statistik Combo untuk tampilan pemain.
                 current_combo: currentCombo,
+
                 best_combo: Math.max(
                     Number(stats.best_combo),
                     currentCombo
                 ),
 
-                // Status Double Points setelah jawaban diproses.
                 double_points_pending:
                     doublePointsActive && isCorrect
                         ? false
@@ -1938,7 +2244,10 @@ socket.on("powerup:use", async (data) => {
     // ======================================
 
     socket.on("disconnect", async () => {
-        console.log("Socket terputus:", socket.id);
+        console.log(
+            "Socket terputus:",
+            socket.id
+        );
 
         try {
             const roomId = socket.data.roomId;
@@ -1970,7 +2279,10 @@ socket.on("powerup:use", async (data) => {
             await publishRoomState(roomId);
 
         } catch (error) {
-            console.error("disconnect error:", error);
+            console.error(
+                "disconnect error:",
+                error
+            );
         }
     });
 });
@@ -2006,6 +2318,8 @@ async function startServer() {
             console.log("Combo Streak: Aktif");
             console.log("Power-Up 50:50: Aktif");
             console.log("Power-Up Double Points: Aktif");
+            console.log("Achievement: Aktif");
+            console.log("Persistent Guest ID: Aktif");
             console.log("----------------------------------");
         });
 

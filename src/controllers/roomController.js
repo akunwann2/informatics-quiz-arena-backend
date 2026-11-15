@@ -24,19 +24,45 @@ function isValidBoolean(value) {
 }
 
 // ========================================
+// VALIDASI GUEST ID
+// ========================================
+function validateGuestId(value) {
+    if (typeof value !== "string") {
+        return null;
+    }
+
+    const guestId = value.trim();
+
+    if (
+        guestId.length < 16 ||
+        guestId.length > 80 ||
+        !/^[a-zA-Z0-9_-]+$/.test(guestId)
+    ) {
+        return null;
+    }
+
+    return guestId;
+}
+
+// ========================================
 // POST /api/rooms
 // MEMBUAT ROOM BARU
 // ========================================
 export const createRoom = async (req, res) => {
     const {
         nickname,
+        guest_id,
         question_count = 25,
         time_per_question = 20,
         enable_combo = false,
         enable_powerup = false
     } = req.body;
 
-    if (!nickname || typeof nickname !== "string" || !nickname.trim()) {
+    if (
+        !nickname ||
+        typeof nickname !== "string" ||
+        !nickname.trim()
+    ) {
         return res.status(400).json({
             success: false,
             message: "Nickname wajib diisi"
@@ -44,6 +70,14 @@ export const createRoom = async (req, res) => {
     }
 
     const cleanNickname = nickname.trim();
+    const cleanGuestId = validateGuestId(guest_id);
+
+    if (!cleanGuestId) {
+        return res.status(400).json({
+            success: false,
+            message: "Guest ID tidak valid"
+        });
+    }
 
     if (cleanNickname.length > 20) {
         return res.status(400).json({
@@ -97,7 +131,6 @@ export const createRoom = async (req, res) => {
         let room;
         let roomCode;
 
-        
         // Membuat kode room unik maksimal 5 kali.
         for (let attempt = 0; attempt < 5; attempt++) {
             roomCode = generateRoomCode();
@@ -138,20 +171,25 @@ export const createRoom = async (req, res) => {
             );
         }
 
-
+        // Simpan Guest ID bersama pemain host.
         const playerResult = await client.query(
             `INSERT INTO room_players
             (
                 room_id,
                 nickname,
+                guest_id,
                 socket_id,
                 score,
                 is_host,
                 is_connected
             )
-            VALUES ($1, $2, NULL, 0, TRUE, TRUE)
+            VALUES ($1, $2, $3, NULL, 0, TRUE, TRUE)
             RETURNING id`,
-            [room.id, cleanNickname]
+            [
+                room.id,
+                cleanNickname,
+                cleanGuestId
+            ]
         );
 
         const player = playerResult.rows[0];
@@ -181,6 +219,7 @@ export const createRoom = async (req, res) => {
                 player: {
                     player_id: player.id,
                     nickname: cleanNickname,
+                    guest_id: cleanGuestId,
                     is_host: true,
                     score: 0
                 }
@@ -192,7 +231,10 @@ export const createRoom = async (req, res) => {
             try {
                 await client.query("ROLLBACK");
             } catch (rollbackError) {
-                console.error("Rollback error:", rollbackError.message);
+                console.error(
+                    "Rollback error:",
+                    rollbackError.message
+                );
             }
         }
 
@@ -215,16 +257,28 @@ export const createRoom = async (req, res) => {
 // BERGABUNG KE ROOM
 // ========================================
 export const joinRoom = async (req, res) => {
-    const { room_code, nickname } = req.body;
+    const {
+        room_code,
+        nickname,
+        guest_id
+    } = req.body;
 
-    if (!room_code || typeof room_code !== "string" || !room_code.trim()) {
+    if (
+        !room_code ||
+        typeof room_code !== "string" ||
+        !room_code.trim()
+    ) {
         return res.status(400).json({
             success: false,
             message: "Kode room wajib diisi"
         });
     }
 
-    if (!nickname || typeof nickname !== "string" || !nickname.trim()) {
+    if (
+        !nickname ||
+        typeof nickname !== "string" ||
+        !nickname.trim()
+    ) {
         return res.status(400).json({
             success: false,
             message: "Nickname wajib diisi"
@@ -233,6 +287,14 @@ export const joinRoom = async (req, res) => {
 
     const cleanRoomCode = room_code.trim().toUpperCase();
     const cleanNickname = nickname.trim();
+    const cleanGuestId = validateGuestId(guest_id);
+
+    if (!cleanGuestId) {
+        return res.status(400).json({
+            success: false,
+            message: "Guest ID tidak valid"
+        });
+    }
 
     if (cleanNickname.length > 20) {
         return res.status(400).json({
@@ -288,7 +350,7 @@ export const joinRoom = async (req, res) => {
             `SELECT COUNT(*) AS total_players
              FROM room_players
              WHERE room_id = $1
-             AND is_connected = TRUE`,
+               AND is_connected = TRUE`,
             [room.id]
         );
 
@@ -309,9 +371,12 @@ export const joinRoom = async (req, res) => {
             `SELECT id
              FROM room_players
              WHERE room_id = $1
-             AND LOWER(nickname) = LOWER($2)
-             AND is_connected = TRUE`,
-            [room.id, cleanNickname]
+               AND LOWER(nickname) = LOWER($2)
+               AND is_connected = TRUE`,
+            [
+                room.id,
+                cleanNickname
+            ]
         );
 
         if (existingPlayerResult.rows.length > 0) {
@@ -323,19 +388,25 @@ export const joinRoom = async (req, res) => {
             });
         }
 
+        // Simpan Guest ID pemain yang bergabung.
         const playerResult = await client.query(
             `INSERT INTO room_players
             (
                 room_id,
                 nickname,
+                guest_id,
                 socket_id,
                 score,
                 is_host,
                 is_connected
             )
-            VALUES ($1, $2, NULL, 0, FALSE, TRUE)
+            VALUES ($1, $2, $3, NULL, 0, FALSE, TRUE)
             RETURNING id`,
-            [room.id, cleanNickname]
+            [
+                room.id,
+                cleanNickname,
+                cleanGuestId
+            ]
         );
 
         const player = playerResult.rows[0];
@@ -366,6 +437,7 @@ export const joinRoom = async (req, res) => {
                 player: {
                     player_id: player.id,
                     nickname: cleanNickname,
+                    guest_id: cleanGuestId,
                     is_host: false,
                     score: 0
                 }
@@ -377,7 +449,10 @@ export const joinRoom = async (req, res) => {
             try {
                 await client.query("ROLLBACK");
             } catch (rollbackError) {
-                console.error("Rollback error:", rollbackError.message);
+                console.error(
+                    "Rollback error:",
+                    rollbackError.message
+                );
             }
         }
 
